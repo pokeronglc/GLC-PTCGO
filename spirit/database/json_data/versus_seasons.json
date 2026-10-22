@@ -1,0 +1,31 @@
+[
+  {
+    "seasonID": "Season1",
+    "startTime": 1767225600000,
+    "endTime": 4102444800000,
+    "description": {
+      "id": "GLC-PTCGO"
+    },
+    "tiers": [
+      {
+        "rewards": {
+          "10000": [
+            {
+              "name": "10 Tokens",
+              "rewardType": "Tokens",
+              "rewardAmount": 10,
+              "rewardProductID": null,
+              "rewardCurrency": "prizeTrainerCoin",
+              "rewardDescription": {
+                "id": ""
+              },
+              "rewardReason": "",
+              "index": 0
+            }
+          ]
+        }
+      }
+    ],
+    "resetRewardID": ""
+  }
+]

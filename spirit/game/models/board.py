@@ -1,0 +1,959 @@
+import uuid
+import json
+import random
+import logging
+from typing import Dict, Any, List, Optional, Union
+from spirit.game.attributes import AttrID, CardType, PokemonStage, Rarities, PlayerAttrID
+from spirit.game.models.card import Card
+from spirit.game.scripts.cards import loader as card_loader
+from spirit.network.message_names import OutboundMsg
+
+# Number of bench slots (standard rules). Serialized onto the bench PlayArea
+# as AttrID.AREA_SLOTS so the client's BenchLayout can space cards.
+BENCH_SLOT_COUNT = 5
+
+
+class BoardEntity:
+    """Base class representing any physical or structural entity on the client's playmat."""
+    def __init__(
+        self,
+        entity_id: Optional[str] = None,
+        parent_id: Optional[str] = None,
+        owning_player_id: Optional[str] = None,
+        archetype_id: Optional[str] = None
+    ):
+        self.entity_id: str = entity_id or str(uuid.uuid4())
+        self.parent_id: Optional[str] = parent_id
+        self.parent: Optional['BoardEntity'] = None
+        self.owning_player_id: Optional[str] = owning_player_id
+        self.archetype_id: Optional[str] = archetype_id
+        # Mirror of the client's A.m slot stamp: the positionInParent of the
+        # last EntityMoved sent for this entity. BenchLayout renders each card
+        # at this slot and never renumbers when a neighbor leaves the bench.
+        self.board_slot: Optional[int] = None
+        self.attributes: Dict[int, Any] = {}
+        # Per-attribute base values: serialized as originalValue when the live
+        # value diverges (e.g. HP max vs remaining -- client damage = max - value).
+        self.attribute_originals: Dict[int, Any] = {}
+        self.children: List[BoardEntity] = []
+
+    def set_attribute(self, key: Union[int, AttrID], value: Any):
+        """Sets an attribute on this entity."""
+        attr_key = key.value if isinstance(key, AttrID) else key
+        self.attributes[attr_key] = value
+
+    def get_attribute(self, key: Union[int, AttrID], default: Any = None) -> Any:
+        """Retrieves an attribute value from this entity."""
+        attr_key = key.value if isinstance(key, AttrID) else key
+        return self.attributes.get(attr_key, default)
+
+    def add_child(self, child: 'BoardEntity', position: Optional[int] = None):
+        """Adds a child entity to this entity, establishing the parent-child relation.
+
+        position inserts at a specific index (e.g. an evolution taking over its
+        target's board slot); None appends to the end.
+        """
+        child.parent_id = self.entity_id
+        child.parent = self
+        if position is None or position >= len(self.children):
+            self.children.append(child)
+        else:
+            self.children.insert(max(position, 0), child)
+
+    def remove_child(self, child: 'BoardEntity'):
+        """Removes a child entity from this entity."""
+        if child in self.children:
+            self.children.remove(child)
+            child.parent_id = None
+            child.parent = None
+
+    def serialize_attributes(self) -> List[Dict[str, Any]]:
+        """Formats the entity's attributes into the specific client-compatible JSON structure."""
+        serialized = []
+        for key, val in self.attributes.items():
+            # If the attribute is NAME (10140) and it's a raw string, format it as localizable text.
+            if key == AttrID.NAME.value and isinstance(val, str):
+                formatted_val = {"id": val}
+            else:
+                formatted_val = val
+
+            original_val = self.attribute_originals.get(key, formatted_val)
+            serialized.append({
+                "name": key,
+                "value": formatted_val,
+                "originalValue": original_val,
+                "modValue": formatted_val
+            })
+        return serialized
+
+    def is_hidden_from(self, viewer_id: Optional[str]) -> bool:
+        """Whether this entity's identity should be hidden from the given viewer.
+
+        Hidden entities serialize with attributes=null, which the client reads
+        as "un-introduced" (SerializedEntity.Introduced == Attributes != null)
+        and renders as a face-down card back in any zone. Structural entities
+        (playmat, players, areas) are never hidden.
+        """
+        return False
+
+    def serialize(self, viewer_id: Optional[str] = None) -> Dict[str, Any]:
+        """Recursively serializes this entity and all its children to match the client expectation."""
+        return {
+            "entityID": self.entity_id,
+            "parentID": self.parent_id,
+            "owningPlayerID": self.owning_player_id,
+            "entityName": self.get_entity_name(),
+            "archetypeID": self.archetype_id,
+            "attributes": None if self.is_hidden_from(viewer_id) else self.serialize_attributes(),
+            "children": [child.serialize(viewer_id) for child in self.children]
+        }
+
+    def get_entity_name(self) -> str:
+        """Returns the fully qualified class name for the client-side entity."""
+        raise NotImplementedError("Subclasses must implement get_entity_name")
+
+
+class PlayMat(BoardEntity):
+    """Represents the root Playmat scene board entity (CakePlayMat)."""
+    def __init__(self, entity_id: Optional[str] = None, theme_name: str = "playmat"):
+        super().__init__(entity_id=entity_id)
+        self.set_attribute(AttrID.NAME, theme_name)
+
+    def get_entity_name(self) -> str:
+        return "com.direwolfdigital.cake.rules.entities.CakePlayMat"
+
+
+class PlayerEntity(BoardEntity):
+    """Represents a player entity wrapper on the playmat (CakePlayerEntity)."""
+    def __init__(self, owning_player_id: str, entity_id: Optional[str] = None):
+        super().__init__(entity_id=entity_id, owning_player_id=owning_player_id)
+        self.set_attribute(AttrID.NAME, "player")
+
+    def get_entity_name(self) -> str:
+        return "com.direwolfdigital.cake.rules.entities.CakePlayerEntity"
+
+
+class PlayArea(BoardEntity):
+    """Represents a play area (pile/zone) on the board (PlayArea)."""
+    def __init__(self, area_name: str, owning_player_id: Optional[str] = None, entity_id: Optional[str] = None):
+        super().__init__(entity_id=entity_id, owning_player_id=owning_player_id)
+        self.set_attribute(AttrID.NAME, area_name)
+
+    def get_entity_name(self) -> str:
+        return "com.direwolfdigital.game.core.PlayArea"
+
+
+def _match_render_attributes(card_obj: Card) -> Dict[int, Any]:
+    """Full render-attribute map for an in-play card entity."""
+    try:
+        raw = card_obj.to_archetype_attributes(card_obj.key)
+    except Exception as e:
+        logging.warning(f"[BoardState] Could not build render attributes for {card_obj.guid}: {e}")
+        return {}
+
+    out: Dict[int, Any] = {}
+    for aid_str, spec in raw.items():
+        key = int(aid_str)
+        vtype = spec.get("type")
+        val = spec.get("value")
+        # JSON-typed attributes (name, types, abilities) are carried as JSON
+        # strings for the protobuf path; the SGS JSON path wants the parsed
+        # structure so JsonFx maps it to the client's typed Attribute<T>.
+        if vtype == "json" and isinstance(val, str):
+            try:
+                val = json.loads(val)
+            except (ValueError, TypeError):
+                pass
+        out[key] = val
+
+    out.pop(AttrID.EXPANSION.value, None)
+    return out
+
+
+class CardEntity(BoardEntity):
+    """Base class for any card placed on the board (Pokemon, Energy, TrainerCard)."""
+    def __init__(self, card_obj: Card, owning_player_id: Optional[str] = None, entity_id: Optional[str] = None):
+        super().__init__(entity_id=entity_id, owning_player_id=owning_player_id, archetype_id=card_obj.guid)
+        self.card_obj = card_obj
+        # Here Comes Team Rocket! permanently turns Prize cards face up.  The
+        # flag follows the physical card while it stays in the Prize pile.
+        self.publicly_revealed: bool = False
+        # Carry the full render attribute set so the client's in-match card-face
+        # renderer can build its image request (set code + collector number).
+        self.attributes.update(_match_render_attributes(card_obj))
+        # The mulligan-reveal carousel resolves each revealed card's archetype
+        # through entity attribute 10000 (GetAttribute<ArchetypeID> in
+        # MulliganCarouselRenderRequester.MulliganSetContents); a card without
+        # it crashes the panel with ArgumentNullException on the lookup.
+        self.set_attribute(AttrID.ARCHETYPE_ID, card_obj.guid)
+        self._initialize_attributes()
+
+    def _initialize_attributes(self):
+        """Copies or sets necessary state attributes from the archetype card object."""
+        # Derived classes will implement card type specific defaults
+        pass
+
+    # Zones whose contents are hidden knowledge even from their owner: nobody
+    # may know their own deck order or prize card faces. The owner learns a
+    # card's identity only when it legally becomes visible (EntityIntroduced
+    # on draw); prize cards are never introduced until taken.
+    HIDDEN_FROM_OWNER_AREAS = ("deck", "prizePile")
+
+    # Zones whose cards are public knowledge to BOTH players. During live play a
+    # non-owner learns these on sight (EntityIntroduced), but the reconnect SGS
+    # is the SOLE source of truth for a fresh client, so they MUST serialize
+    # face-up regardless of viewer or the reconnecting player sees card backs.
+    PUBLIC_AREAS = ("activePokemonArea", "bench", "discard", "lostZone",
+                    "activeStadium", "activeTrainer")
+
+    def _containing_area_name(self) -> Optional[str]:
+        """Name of the PlayArea this card ultimately sits in, walking up through
+        any Pokemon it is attached to."""
+        node = self.parent
+        while node is not None:
+            if isinstance(node, PlayArea):
+                return node.get_attribute(AttrID.NAME)
+            node = node.parent
+        return None
+
+    def is_hidden_from(self, viewer_id: Optional[str]) -> bool:
+        """A card's identity is hidden from non-owners unless it sits in a public
+        zone; from its owner only while in a hidden-knowledge zone (deck/prizes)."""
+        if viewer_id is None:
+            return False
+        if getattr(self, "publicly_revealed", False) \
+                and self._containing_area_name() == "prizePile":
+            return False
+        area_name = self._containing_area_name()
+        if viewer_id != self.owning_player_id:
+            return area_name not in self.PUBLIC_AREAS
+        return area_name in self.HIDDEN_FROM_OWNER_AREAS
+
+
+class PokemonEntity(CardEntity):
+    """Represents a Pokemon card entity on the board."""
+
+    # A Pokemon BREAK keeps these printed characteristics from the Pokemon it
+    # evolved from.  BREAK cards carry harmless renderer defaults of their own
+    # (no Weakness/Resistance and zero Retreat), so ordinary attribute reads
+    # must look through the live BREAK stack instead of trusting those defaults.
+    _BREAK_INHERITED_ATTRIBUTES = frozenset({
+        AttrID.RETREAT_COST.value,
+        AttrID.WEAKNESS_TYPES.value,
+        AttrID.WEAKNESS_OPERATOR.value,
+        AttrID.WEAKNESS_AMOUNT.value,
+        AttrID.RESISTANCE_TYPES.value,
+        AttrID.RESISTANCE_OPERATOR.value,
+        AttrID.RESISTANCE_AMOUNT.value,
+    })
+
+    def break_previous_stage(self) -> Optional['PokemonEntity']:
+        """Immediate previous Evolution tucked under this Pokemon BREAK."""
+        if super().get_attribute(AttrID.STAGE) != PokemonStage.BREAK.value:
+            return None
+        return next(
+            (child for child in self.children
+             if isinstance(child, PokemonEntity)),
+            None,
+        )
+
+    def get_attribute(self, key: Union[int, AttrID], default: Any = None) -> Any:
+        """Return live printed attributes, including Pokemon BREAK inheritance."""
+        attr_key = key.value if isinstance(key, AttrID) else key
+        if attr_key in self._BREAK_INHERITED_ATTRIBUTES:
+            previous = self.break_previous_stage()
+            if previous is not None:
+                return previous.get_attribute(attr_key, default)
+        return super().get_attribute(attr_key, default)
+
+    def _initialize_attributes(self):
+        super()._initialize_attributes()
+        if self.card_obj.get_attribute_value(AttrID.STAGE) in (PokemonStage.LEGEND.value, PokemonStage.VUNION.value):
+            # Rules operate on PokemonEntity pairs; only the wire format uses
+            # LegendHalf. Keep Pokemon searches and pair rules unchanged.
+            self.set_attribute(AttrID.CARD_TYPE, CardType.POKEMON.value)
+        # V-UNION fragments have no HP outside play; never manufacture 100 HP.
+        fragment = (self.card_obj.get_attribute_value(AttrID.STAGE) == PokemonStage.VUNION.value
+                    and self.card_obj.get_attribute_value(AttrID.HP) is None)
+        hp_val = self.card_obj.get_attribute_value(AttrID.HP, 0 if fragment else 100)
+        self.set_attribute(AttrID.HP, hp_val)
+        self.attribute_originals[AttrID.HP.value] = hp_val
+
+    # Zones where an Item "played as a Basic Pokemon" (fossils, Lillie's Poke
+    # Doll, Robo Substitute) IS a Pokemon.
+    IN_PLAY_AREAS = ("activePokemonArea", "bench")
+
+    def plays_as_pokemon(self) -> bool:
+        """Trainer archetype played as a Basic Pokemon (FossilItemCardDef)."""
+        if self.get_attribute(AttrID.CARD_TYPE) != CardType.TRAINER.value:
+            return False
+        from spirit.game.data_utils import def_for  # circular-import guard
+        return bool(getattr(def_for(self.archetype_id), "plays_as_pokemon", False))
+
+    def in_play_as_pokemon(self) -> bool:
+        """An Item played as a Pokemon sitting in play as a Pokemon in its own
+        right: a direct child of the Active Spot / Bench (pokemon_in_play).
+        Tucked under an evolution it is an attachment again."""
+        parent = self.parent
+        return (isinstance(parent, PlayArea)
+                and parent.get_attribute(AttrID.NAME) in self.IN_PLAY_AREAS
+                and self.plays_as_pokemon())
+
+    def client_card_type(self) -> int:
+        """CARD_TYPE as the client must see it.
+
+        Location-aware for Items played as Pokemon: Pokemon while in the
+        Active Spot / on the Bench (the client's drag-drop, Knockout and
+        evolution code all key off CARD_TYPE) and in the hand (these cards
+        can only be played as a Basic Pokemon; typed as a Trainer there the
+        client stages the drop as an Item play and then waits forever for a
+        Bench "target" -- the Oct 13 Poke Doll report), the printed Trainer
+        type everywhere else (under an evolution, in discard/deck/prizes).
+        The rules side keeps the printed Trainer type in AttrID.CARD_TYPE
+        at all times."""
+        if getattr(self, "_wire_as_energy", False):
+            return CardType.ENERGY.value
+        if (self.get_attribute(AttrID.STAGE) == PokemonStage.LEGEND.value
+                or (self.get_attribute(AttrID.STAGE) == PokemonStage.VUNION.value
+                    and self.card_obj.get_attribute_value(AttrID.HP) is None)):
+            return CardType.LEGEND_HALF.value
+        if self.in_play_as_pokemon() or self.in_hand_as_pokemon():
+            return CardType.POKEMON.value
+        return self.get_attribute(AttrID.CARD_TYPE)
+
+    def in_hand_as_pokemon(self) -> bool:
+        """An Item played as a Pokemon, sitting in a hand."""
+        parent = self.parent
+        return (isinstance(parent, PlayArea)
+                and parent.get_attribute(AttrID.NAME) == "hand"
+                and self.plays_as_pokemon())
+
+    def serialize_attributes(self) -> List[Dict[str, Any]]:
+        attributes = super().serialize_attributes()
+        if getattr(self, "_wire_as_energy", False):
+            attributes = [a for a in attributes
+                          if a["name"] != AttrID.IS_SPECIAL_ENERGY.value]
+            attributes.append({"name": AttrID.IS_SPECIAL_ENERGY.value, "value": True,
+                               "originalValue": True, "modValue": True})
+        client_type = self.client_card_type()
+        if client_type == CardType.POKEMON.value and self.plays_as_pokemon():
+            # The client picks the DRAG handler from TRAINER_TYPE alone
+            # (SelectableObject.FireDragCommand -> EntityUtil.IsTrainer =
+            # TRAINER_TYPE has a value): a Poke Doll / Robo Substitute that
+            # still carried it was dragged as an Item, and a drop anywhere
+            # but exactly on the Bench staged it mid-board forever (owner
+            # report Oct 21). While the client must treat it as a Pokemon,
+            # send TRAINER_TYPE empty; rules keep the printed value.
+            for attribute in attributes:
+                if attribute["name"] == AttrID.TRAINER_TYPE.value:
+                    for field in ("value", "originalValue", "modValue"):
+                        attribute[field] = None
+        if client_type == self.get_attribute(AttrID.CARD_TYPE):
+            return attributes
+        # Snapshots (reconnect SerializedGameState) and EntityIntroduced
+        # carry the client-facing type: LEGEND halves, in-play fossils/dolls.
+        for attribute in attributes:
+            if attribute["name"] == AttrID.CARD_TYPE.value:
+                for field in ("value", "originalValue", "modValue"):
+                    attribute[field] = client_type
+        return attributes
+
+    def get_entity_name(self) -> str:
+        # A Pokemon attached as Energy (Electrode Buzzap / Charjabug Battery):
+        # the client's AttachmentCoordinator draws an Energy circle only for
+        # children whose ENTITY NAME is ...entities.Energy (EntityUtil.IsEnergy).
+        if getattr(self, "_wire_as_energy", False):
+            return "com.direwolfdigital.cake.rules.entities.Energy"
+        if self.client_card_type() == CardType.LEGEND_HALF.value:
+            return "com.direwolfdigital.cake.rules.entities.HalfLegend"
+        return "com.direwolfdigital.cake.rules.entities.Pokemon"
+
+
+class CompositePokemonEntity(PokemonEntity):
+    """One in-play Pokemon backed by multiple physical cards, never a deck card."""
+
+    def serialize(self, viewer_id: Optional[str] = None) -> Dict[str, Any]:
+        tree = super().serialize(viewer_id)
+        part_ids = {part.entity_id for part in self.physical_parts}
+        tree['children'] = [c for c in tree['children'] if c['entityID'] not in part_ids]
+        return tree
+
+
+class LegendPokemonEntity(CompositePokemonEntity):
+    """Native in-play composite, not a third physical card.
+
+    LegendaryCardRenderer combines the two physical HalfLegend entities referenced by
+    these IDs. Neither this wrapper nor its ID can enter a private card pile.
+    """
+    def __init__(self, top: PokemonEntity, bottom: PokemonEntity):
+        super().__init__(top.card_obj, top.owning_player_id)
+        self.legend_halves = (top, bottom)
+        self.physical_parts = self.legend_halves
+        self.set_attribute(AttrID.IS_LEGEND, True)
+        self.set_attribute(AttrID.LEGEND_TOP_HALF, top.entity_id)
+        self.set_attribute(AttrID.LEGEND_BOTTOM_HALF, bottom.entity_id)
+
+    def client_card_type(self) -> int:
+        return CardType.POKEMON.value
+
+    def get_entity_name(self) -> str:
+        return "com.direwolfdigital.cake.rules.entities.LegendPokemon"
+
+    def serialize(self, viewer_id: Optional[str] = None) -> Dict[str, Any]:
+        tree = super().serialize(viewer_id)
+        # The native zoom creates two renderer slots for the composite. Its
+        # half IDs resolve through the entity registry, NOT through Children.
+        # Listing the physical halves here adds them a second time as attached
+        # cards, and the native two-slot LEGEND navigation skips the lower art.
+        # Keep the rules tree intact; BoardState parks their wire entities in
+        # outOfPlay so both referenced images remain available on reconnect.
+        half_ids = {half.entity_id for half in self.legend_halves}
+        tree['children'] = [c for c in tree['children'] if c['entityID'] not in half_ids]
+        return tree
+
+
+class EnergyEntity(CardEntity):
+    """Represents an Energy card entity on the board."""
+    def get_entity_name(self) -> str:
+        return "com.direwolfdigital.cake.rules.entities.Energy"
+
+
+class TrainerEntity(CardEntity):
+    """Represents a Trainer card entity on the board."""
+    def get_entity_name(self) -> str:
+        return "com.direwolfdigital.cake.rules.entities.TrainerCard"
+
+
+def create_card_entity(card_obj: Card, owning_player_id: Optional[str] = None, entity_id: Optional[str] = None) -> CardEntity:
+    """Factory function to build the correct subclass of CardEntity based on its card type."""
+    c_type = card_obj.get_attribute_value(AttrID.CARD_TYPE)
+    if c_type == CardType.POKEMON.value:
+        return PokemonEntity(card_obj, owning_player_id, entity_id)
+    elif c_type == CardType.ENERGY.value:
+        return EnergyEntity(card_obj, owning_player_id, entity_id)
+    else:
+        from spirit.game.data_utils import def_for  # circular-import guard
+        if getattr(def_for(card_obj.guid), "plays_as_pokemon", False):
+            # Fossils: Trainer archetype, Pokemon entity on the board.
+            return PokemonEntity(card_obj, owning_player_id, entity_id)
+        return TrainerEntity(card_obj, owning_player_id, entity_id)
+
+
+class BoardState:
+    """Manages the full tree layout of the Playmat, keeping O(1) cache of all entities for rapid access."""
+    def __init__(self, game_id: str, player_ids: List[str]):
+        self.game_id: str = game_id
+        self.player_ids: List[str] = player_ids
+        
+        # Build Playmat Root Entity
+        self.playmat = PlayMat()
+        # Card passives sometimes receive only an entity yet need board-wide
+        # state (Prize counts, effective types/costs).  The entity tree ends at
+        # PlayMat, so keep a non-serialized back-reference at that root.
+        self.playmat._board_state = self
+        
+        # Internal cache map (entityID -> BoardEntity) for O(1) lookups
+        self._entity_cache: Dict[str, BoardEntity] = {self.playmat.entity_id: self.playmat}
+        # Empty composites leave the rules tree immediately; client removal
+        # follows the last physical card's movement, separately per viewer.
+        self.retired_legends: Dict[str, Dict[str, Any]] = {}
+        
+        self.game_options: Dict[str, Any] = {
+            "theme": "ForestPlaymat"
+        }
+        # player_id -> prize cards dealt at setup; prizes taken = dealt - remaining.
+        self.prizes_dealt: Dict[str, int] = {}
+        # player_id -> {"GX": bool, "VSTAR": bool}: which playmat markers the
+        # deck earns. Drives gameOptions["tokens"]; the PlayerEntity attributes
+        # of the same name mean "spent", which is a different question.
+        self.token_kinds: Dict[str, Dict[str, bool]] = {}
+        # Set by GameSession once both exist; damage/condition lookups read it
+        # defensively (getattr(board, "turn_state", None)) for bare test boards.
+        self.turn_state = None
+        # Effect-granted TempPassive entries (passives.py); pruned by
+        # TurnState.begin_turn expiry and GameSession.clear_pokemon_effects.
+        self.temporary_passives: List[Any] = []
+
+        self._initialize_board()
+
+    def _register_entity(self, entity: BoardEntity):
+        """Registers an entity and recursively its children in the lookup cache."""
+        self._entity_cache[entity.entity_id] = entity
+        for child in entity.children:
+            self._register_entity(child)
+
+    def _unregister_entity(self, entity: BoardEntity):
+        """Unregisters an entity and recursively its children from the lookup cache."""
+        if entity.entity_id in self._entity_cache:
+            del self._entity_cache[entity.entity_id]
+        for child in entity.children:
+            self._unregister_entity(child)
+
+    def get_entity(self, entity_id: str) -> Optional[BoardEntity]:
+        """Retrieves an entity from the board by its entity ID in O(1) time."""
+        return self._entity_cache.get(entity_id)
+
+    def _initialize_board(self):
+        """Sets up the initial board structures with global areas and player-specific areas."""
+        # 1. Build Global Areas
+        global_piles = ["outOfPlay", "activeStadium", "activeTrainer"]
+        for pile_name in global_piles:
+            area = PlayArea(pile_name)
+            self.playmat.add_child(area)
+            self._register_entity(area)
+
+        # 2. Build Player Entities and their sub-areas
+        player_piles = ["deck", "hand", "bench", "activePokemonArea", "discard", "prizePile", "lostZone"]
+        for p_id in self.player_ids:
+            player_entity = PlayerEntity(p_id)
+            self.playmat.add_child(player_entity)
+            self._register_entity(player_entity)
+
+            for pile_name in player_piles:
+                area = PlayArea(pile_name, owning_player_id=p_id)
+                if pile_name == "bench":
+                    # BenchLayout (client) spaces cards by dividing by this
+                    # slot count (attr 201920 via the U.E facet); without it
+                    # Slots reads 0 and every benched card gets a NaN
+                    # transform (invisible card + collider crash).
+                    area.set_attribute(AttrID.AREA_SLOTS, BENCH_SLOT_COUNT)
+                player_entity.add_child(area)
+                self._register_entity(area)
+
+    def find_player_entity(self, player_id: str) -> Optional[PlayerEntity]:
+        """Finds the PlayerEntity on the playmat for a given player ID."""
+        for child in self.playmat.children:
+            if isinstance(child, PlayerEntity) and child.owning_player_id == player_id:
+                return child
+        return None
+
+    def find_player_area(self, player_id: str, area_name: str) -> Optional[PlayArea]:
+        """Finds a specific play area for a given player ID (e.g., 'deck', 'hand')."""
+        player_entity = self.find_player_entity(player_id)
+        if player_entity:
+            for sub_child in player_entity.children:
+                if isinstance(sub_child, PlayArea) and sub_child.get_attribute(AttrID.NAME) == area_name:
+                    return sub_child
+        return None
+
+    def find_global_area(self, area_name: str) -> Optional[PlayArea]:
+        """Finds a global play area by its name (e.g., 'activeStadium')."""
+        for child in self.playmat.children:
+            if isinstance(child, PlayArea) and child.get_attribute(AttrID.NAME) == area_name:
+                return child
+        return None
+
+    def add_card_to_area(self, card_entity: CardEntity, area: PlayArea):
+        """Inserts a card entity into a play area, updating ownership and registration."""
+        area.add_child(card_entity)
+        card_entity.owning_player_id = area.owning_player_id
+        self._register_entity(card_entity)
+
+    def move_card(self, card_id: str, to_area_id: str, position: Optional[int] = None) -> bool:
+        """Moves a card entity to a target play area, handling parent association gracefully."""
+        card = self.get_entity(card_id)
+        to_area = self.get_entity(to_area_id)
+
+        if not isinstance(card, CardEntity) or not isinstance(to_area, PlayArea):
+            return False
+        if isinstance(card, CompositePokemonEntity) and to_area.get_attribute(AttrID.NAME) not in (
+                "bench", "activePokemonArea"):
+            return False
+
+        old_parent = card.parent
+        if card.parent_id:
+            parent = self.get_entity(card.parent_id)
+            if parent:
+                parent.remove_child(card)
+
+        to_area.add_child(card, position)
+        card.owning_player_id = to_area.owning_player_id
+        self._retire_empty_legend(old_parent, card_id, to_area_id)
+        return True
+
+    def _retire_empty_legend(self, parent, moved_id, destination_id):
+        if not isinstance(parent, CompositePokemonEntity) or parent.children:
+            return
+        if parent.parent is not None:
+            parent.parent.remove_child(parent)
+        self._unregister_entity(parent)
+        self.retired_legends[parent.entity_id] = {
+            "entity": parent, "last_card": moved_id,
+            "destination": destination_id, "delivered": set(),
+        }
+
+    def attach_card(self, card_id: str, to_entity_id: str) -> bool:
+        """Reparents a card underneath another CARD entity (not a play area).
+
+        This is how energy attachments and evolution stacks are modeled: the
+        attached card becomes a child of the Pokemon entity, mirroring the
+        client's entity tree where a pile's top card renders and its children
+        ride along (energy pips, tools, previous stages).
+        """
+        card = self.get_entity(card_id)
+        target = self.get_entity(to_entity_id)
+
+        if not isinstance(card, CardEntity) or not isinstance(target, CardEntity):
+            return False
+        if card is target:
+            return False
+
+        old_parent = card.parent
+        if card.parent_id:
+            parent = self.get_entity(card.parent_id)
+            if parent:
+                parent.remove_child(card)
+
+        target.add_child(card)
+        card.owning_player_id = target.owning_player_id
+        self._retire_empty_legend(old_parent, card_id, to_entity_id)
+        return True
+
+    def shuffle_deck(self, player_id: str, rng: Optional[random.Random] = None) -> bool:
+        """Randomizes the order of the player's deck in place.
+        """
+        deck_area = self.find_player_area(player_id, "deck")
+        if not deck_area:
+            return False
+        (rng or random).shuffle(deck_area.children)
+        return True
+
+    def deal_from_deck(self, player_id: str, area_name: str, count: int, *,
+                       from_bottom: bool = False) -> List[Dict[str, Any]]:
+        """Moves the top `count` cards from the player's deck into one of their areas.
+
+        Returns move descriptors ({entity_id, destination_id, position, card})
+        in deal order for building EntityMoved messages.
+        """
+        deck_area = self.find_player_area(player_id, "deck")
+        dest_area = self.find_player_area(player_id, area_name)
+        if not deck_area or not dest_area:
+            return []
+
+        moved: List[Dict[str, Any]] = []
+        for _ in range(count):
+            if not deck_area.children:
+                break
+            # Top of the deck is the last child (cards are appended when populated).
+            card = deck_area.children[0 if from_bottom else -1]
+            position = len(dest_area.children)
+            if not self.move_card(card.entity_id, dest_area.entity_id):
+                break
+            moved.append({
+                "entity_id": card.entity_id,
+                "destination_id": dest_area.entity_id,
+                "position": position,
+                "card": card,
+            })
+        if area_name == "prizePile" and moved:
+            self.prizes_dealt[player_id] = self.prizes_dealt.get(player_id, 0) + len(moved)
+        return moved
+
+    def prizes_taken(self, player_id: str) -> int:
+        """Prize cards the player has taken so far this game."""
+        area = self.find_player_area(player_id, "prizePile")
+        if not area:
+            return 0
+        return max(0, self.prizes_dealt.get(player_id, 0) - len(area.children))
+
+    def draw_cards(self, player_id: str, count: int, *, from_bottom: bool = False) -> List[Dict[str, Any]]:
+        """Moves the top `count` cards from the player's deck into their hand."""
+        return self.deal_from_deck(player_id, "hand", count, from_bottom=from_bottom)
+
+    @staticmethod
+    def _is_basic_pokemon(entity: BoardEntity) -> bool:
+        # Fossils (Trainer archetypes played as Pokemon) don't count for
+        # mulligans or setup placement.
+        return (
+            isinstance(entity, PokemonEntity)
+            and entity.card_obj.get_attribute_value(AttrID.CARD_TYPE) == CardType.POKEMON.value
+            and entity.card_obj.get_attribute_value(AttrID.STAGE) == PokemonStage.BASIC.value
+        )
+
+    def basic_pokemon_in_hand(self, player_id: str) -> List['PokemonEntity']:
+        """All Basic Pokemon entities currently in the player's hand that may
+        be played from it (Shedinja's unplayable_from_hand is excluded, so it
+        neither satisfies the mulligan check nor offers as a placement)."""
+        from spirit.game.data_utils import def_for  # circular-import guard
+        hand_area = self.find_player_area(player_id, "hand")
+        if not hand_area:
+            return []
+        basics: List[PokemonEntity] = []
+        for c in hand_area.children:
+            if isinstance(c, PokemonEntity) and self._is_basic_pokemon(c):
+                if getattr(def_for(c.archetype_id), "unplayable_from_hand", False):
+                    continue
+                basics.append(c)
+        return basics
+
+    def has_basic_pokemon_in_hand(self, player_id: str) -> bool:
+        """True if the player's hand contains at least one Basic Pokemon.
+
+        A hand with no Basic Pokemon forces a mulligan in the setup phase.
+        """
+        return bool(self.basic_pokemon_in_hand(player_id))
+
+    def _setup_card_allowed(self, card, player_id: str) -> bool:
+        from spirit.game.data_utils import def_for
+        if not getattr(def_for(card.archetype_id), "setup_second_player_only", False):
+            return True
+        first = getattr(self, "setup_first_player_id", None)
+        return first is not None and first != player_id
+
+    def setup_active_candidates(self, player_id: str) -> List['PokemonEntity']:
+        """Cards playable as the opening Active: Basics first, then hand
+        Pokemon whose def sets setup_as_active (Luxray CZ's Explosiveness).
+        The bench offer and mid-game bench plays stay Basics-only."""
+        from spirit.game.data_utils import def_for  # circular-import guard
+        candidates = self.basic_pokemon_in_hand(player_id)
+        hand_area = self.find_player_area(player_id, "hand")
+        for c in (hand_area.children if hand_area else []):
+            if isinstance(c, PokemonEntity) and c not in candidates \
+                    and getattr(def_for(c.archetype_id), "setup_as_active", False) \
+                    and self._setup_card_allowed(c, player_id):
+                candidates.append(c)
+        return candidates
+
+    def setup_bench_candidates(self, player_id: str) -> List['PokemonEntity']:
+        """Basic Pokemon plus cards explicitly legal on the opening Bench.
+
+        Snorlax Doll is still an Item in deck construction and must not make a
+        hand non-mulligan by itself unless it can actually be placed during
+        setup.  Unlike setup-only Active exceptions, its text permits either
+        opening position.
+        """
+        from spirit.game.data_utils import def_for  # circular-import guard
+        candidates = self.basic_pokemon_in_hand(player_id)
+        hand_area = self.find_player_area(player_id, "hand")
+        for card in (hand_area.children if hand_area else []):
+            if isinstance(card, PokemonEntity) and card not in candidates \
+                    and getattr(def_for(card.archetype_id), "setup_as_bench", False) \
+                    and self._setup_card_allowed(card, player_id):
+                candidates.append(card)
+        return candidates
+
+    def player_has_any_basic(self, player_id: str) -> bool:
+        """True if the player has a Basic Pokemon anywhere in deck or hand.
+
+        Guards the mulligan loop against decks that can never produce a legal
+        opening hand (which would otherwise reshuffle forever).
+        """
+        from spirit.game.data_utils import def_for  # circular-import guard
+        for area_name in ("deck", "hand"):
+            area = self.find_player_area(player_id, area_name)
+            for c in (area.children if area else []):
+                if self._is_basic_pokemon(c):
+                    return True
+                if isinstance(c, PokemonEntity) \
+                        and getattr(def_for(c.archetype_id), "setup_as_active", False) \
+                        and self._setup_card_allowed(c, player_id):
+                    return True
+        return False
+
+    def pokemon_in_play(self, player_id: str) -> List['PokemonEntity']:
+        """The player's top-level Pokemon: the Active plus every benched one.
+
+        Only direct children of the areas count -- cards stacked underneath a
+        Pokemon (energy, tools, pre-evolutions) are attachments, not Pokemon
+        in play.
+        """
+        in_play: List[PokemonEntity] = []
+        for area_name in ("activePokemonArea", "bench"):
+            area = self.find_player_area(player_id, area_name)
+            for child in (area.children if area else []):
+                if isinstance(child, PokemonEntity):
+                    in_play.append(child)
+        return in_play
+
+    def active_pokemon(self, player_id: str) -> Optional['PokemonEntity']:
+        """The player's Active Pokemon (top-level card of the active area)."""
+        area = self.find_player_area(player_id, "activePokemonArea")
+        for child in (area.children if area else []):
+            if isinstance(child, PokemonEntity):
+                return child
+        return None
+
+    def free_bench_slot(self, player_id: str) -> int:
+        """Lowest bench slot not occupied by a current bench child's stamp.
+
+        The client keeps every benched card at the slot it arrived in
+        (positionInParent), leaving a gap when one is promoted/knocked out,
+        so new arrivals must fill gaps instead of appending by list length.
+        """
+        bench = self.find_player_area(player_id, "bench")
+        if not bench:
+            return 0
+        occupied = {self.bench_slot_of(c) for c in bench.children}
+        for slot in range(BENCH_SLOT_COUNT):
+            if slot not in occupied:
+                return slot
+        return len(bench.children)
+
+    @staticmethod
+    def bench_slot_of(entity: 'BoardEntity') -> int:
+        """The slot the client renders this benched entity at (stamp, else list index)."""
+        if entity.board_slot is not None:
+            return entity.board_slot
+        if entity.parent is not None and entity in entity.parent.children:
+            return entity.parent.children.index(entity)
+        return 0
+
+    @staticmethod
+    def attached_energies(pokemon: 'PokemonEntity') -> List['CardEntity']:
+        """Every card currently functioning as Energy under a Pokemon.
+
+        A few printed Pokemon (Charjabug's Battery and Electrode's Buzzap
+        Thunder) attach themselves as Special Energy.  Their physical entity
+        remains a Pokemon card so the client keeps the correct artwork, but
+        ENERGY_INFO is the authoritative rules marker while attached.
+        """
+        energies: List[CardEntity] = []
+        stack: List[BoardEntity] = list(pokemon.children)
+        while stack:
+            entity = stack.pop()
+            if isinstance(entity, CardEntity) and (
+                    isinstance(entity, EnergyEntity)
+                    or bool(entity.get_attribute(AttrID.ENERGY_INFO))):
+                energies.append(entity)
+            stack.extend(entity.children)
+        return energies
+
+    def return_hand_to_deck(self, player_id: str):
+        """Moves every card in the player's hand back into their deck (for a mulligan reshuffle)."""
+        hand_area = self.find_player_area(player_id, "hand")
+        deck_area = self.find_player_area(player_id, "deck")
+        if not hand_area or not deck_area:
+            return
+        for card in list(hand_area.children):
+            self.move_card(card.entity_id, deck_area.entity_id)
+
+    def populate_deck(self, player_id: str, deck_data: Dict[str, Any]):
+        """Decodes the player deck definition, pre-populates card entities, and updates player token attributes."""
+        from spirit.game.data_utils import def_for  # circular-import guard
+        deck_area = self.find_player_area(player_id, "deck")
+        if not deck_area:
+            return
+
+        actual_deck = deck_data.get("deck", deck_data)
+        cards_list = actual_deck.get("cards", [])
+
+        # Reconstruct cards from standard DB piles structure (supporting both 'deck' and client-serialized 'CakePile')
+        if not cards_list and "piles" in actual_deck and isinstance(actual_deck["piles"], dict):
+            piles_deck = None
+            if "deck" in actual_deck["piles"]:
+                piles_deck = actual_deck["piles"]["deck"]
+            elif "CakePile" in actual_deck["piles"]:
+                piles_deck = actual_deck["piles"]["CakePile"]
+
+            if isinstance(piles_deck, list):
+                counts = {}
+                for guid in piles_deck:
+                    if guid:
+                        # Normalize GUID to lowercase to ensure match with loaders
+                        counts[guid.lower()] = counts.get(guid.lower(), 0) + 1
+                cards_list = [{"guid": g, "count": c} for g, c in counts.items()]
+
+        has_gx = False
+        has_vstar = False
+
+        for card_item in cards_list:
+            guid = card_item.get("guid")
+            count = card_item.get("count", 1)
+
+            if guid:
+                card_obj = card_loader.cards_by_guid.get(guid.lower())
+                if card_obj:
+                    # Scan for GX and VSTAR card identifiers to set playmat tokens
+                    stage = card_obj.get_attribute_value(AttrID.STAGE)
+                    rarity = card_obj.get_attribute_value(AttrID.RARITY)
+                    display_name = getattr(card_obj, "display_name", "") or ""
+                    searchable = getattr(card_obj, "searchable_by", [])
+                    definition = def_for(guid)
+                    # Seal Stones grant VSTAR Powers without being VSTAR
+                    # Pokemon. Their marker must still exist on the playmat.
+                    powers = list(getattr(definition, "abilities", ()) or ())
+                    powers += list(getattr(definition, "granted_abilities", ()) or ())
+                    has_vstar = has_vstar or any(a.vstar for a in powers)
+                    has_gx = has_gx or any(a.gx for a in powers)
+
+                    if (
+                        stage == PokemonStage.VSTAR.value or
+                        rarity == Rarities.RareHoloVSTAR.value or
+                        "VSTAR" in display_name or
+                        any("vstar" in s.lower() for s in searchable)
+                    ):
+                        has_vstar = True
+
+                    if (
+                        rarity == Rarities.RareHoloGX.value or
+                        "GX" in display_name or
+                        "-GX" in display_name or
+                        any("gx" in s.lower() for s in searchable)
+                    ):
+                        has_gx = True
+
+                    for _ in range(count):
+                        card_entity = create_card_entity(card_obj, owning_player_id=player_id)
+                        self.add_card_to_area(card_entity, deck_area)
+                else:
+                    logging.warning(f"[BoardState] Failed to find card object for GUID: {guid}")
+
+        # Which markers this deck earns a place on the playmat for. The token
+        # is spawned from gameOptions["tokens"], NOT from the player attribute
+        # below, so the two are tracked separately.
+        self.token_kinds[player_id] = {"GX": has_gx, "VSTAR": has_vstar}
+
+        # PieGXToken.setupAnimator reads these attributes as "this player's
+        # marker is already SPENT" and rebuilds the token on its used face
+        # when they are true -- it is the reconnect state, not a has-a-token
+        # flag. Both start false and are raised when the power is used.
+        player_entity = self.find_player_entity(player_id)
+        if player_entity:
+            player_entity.set_attribute(PlayerAttrID.HAS_GX_TOKEN, False)
+            player_entity.set_attribute(PlayerAttrID.HAS_VSTAR_TOKEN, False)
+            logging.info(f"[BoardState] Token markers for {player_id}: GX={has_gx}, VSTAR={has_vstar} (both unspent)")
+
+    def _refresh_bench_gaps(self):
+        """Syncs each bench's slot-order and AREA_EMPTY_SLOTS for SGS loads.
+
+        Freshly loaded entities carry no A.m stamps, so the client lays the
+        bench out sequentially, skipping the gaps listed in attr 201860.
+        """
+        for p_id in self.player_ids:
+            bench = self.find_player_area(p_id, "bench")
+            if not bench:
+                continue
+            bench.children.sort(key=self.bench_slot_of)
+            occupied = {self.bench_slot_of(c) for c in bench.children}
+            slots = bench.get_attribute(AttrID.AREA_SLOTS) or BENCH_SLOT_COUNT
+            bench.set_attribute(
+                AttrID.AREA_EMPTY_SLOTS,
+                [s for s in range(slots) if s not in occupied],
+            )
+
+    def serialize(self, viewer_id: Optional[str] = None) -> Dict[str, Any]:
+        """Builds the final SerializedGameState dict expected by the client network router.
+
+        viewer_id scopes hidden information: cards not owned by the viewer are
+        serialized un-introduced (attributes=null) so they render face-down.
+        """
+        self._refresh_bench_gaps()
+        entities = self.playmat.serialize(viewer_id)
+        out = self.find_global_area('outOfPlay')
+        if out is not None:
+            wire_out = next(c for c in entities['children'] if c['entityID'] == out.entity_id)
+            for owner in self.player_ids:
+                for pokemon in self.pokemon_in_play(owner):
+                    if isinstance(pokemon, CompositePokemonEntity):
+                        for half in pokemon.physical_parts:
+                            if half.parent is pokemon:
+                                wire_half = half.serialize(viewer_id)
+                                wire_half['parentID'] = out.entity_id
+                                wire_out['children'].append(wire_half)
+        return {
+            "messageName": OutboundMsg.SERIALIZED_GAME_STATE.value,
+            "gameID": self.game_id,
+            "playerAccounts": self.player_ids,
+            "gameOptions": self.game_options,
+            "entities": entities
+        }

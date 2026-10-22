@@ -1,0 +1,163 @@
+INSTALLING CARD ARTWORK AND OPTIONAL BUNDLES
+============================================
+
+Either obtain the original bundles of PTCGO and/or use the script to download
+missing card arts.
+
+CompletePTCGO does not distribute card artwork, the original PTCGO client, or
+the original game AssetBundles in the repository. Card artwork can be
+downloaded separately using the command below; the original PTCGO bundles is optional
+if you want original artwork, game images like landing page carrousel and global background and foil masks.
+You still need your own compatible PTCGO client.
+
+Requirements
+------------
+
+1. A compatible Pokemon TCG Online client (version 2.95.0.5815).
+2. Python and the project dependencies installed as described in README.md.
+3. An internet connection for downloading card artwork.
+4. Optional: a local bundles folder. Depending on your archive, it can contain:
+   - BW Cache.zip
+   - SM Cache.zip
+   - PTCGO Exe.zip
+   - the era/set artwork ZIP files supplied with the bundles
+
+OPTION A: Download card artwork WITHOUT original bundles
+-------------------------------------------------------
+
+Open PowerShell in the repository and activate the installed environment:
+
+   .\venv\Scripts\Activate.ps1
+   python -m spirit.tools.install_recent_card_art
+
+Despite its historical name, this installer covers ALL implemented card
+collections, from HGSS through Mega Evolution, not just recent cards.
+No BW Cache.zip, SM Cache.zip, PTCGO Exe.zip, --cbrew-source,
+PTCGO_ART_SOURCE_DIR or PTCGO_CACHE_DIR is required for this command.
+
+On an empty artwork directory it downloads the full implemented catalog.
+On subsequent runs it downloads only missing files, preserving existing
+artwork.
+
+The downloader reads English image URLs from the bundled card catalogs,
+including Pokemon TCG and Scrydex URLs. It tries an alternate source when
+available if the first source fails. Some promos use the English Limitless
+archive; unnumbered Energy scans use PkmnCards. JPEG/WebP scans are decoded
+and saved as real PNG files, not just renamed.
+
+The first download can take a long time and consume substantial disk space
+and bandwidth. Keep the terminal open until it finishes. If interrupted,
+rerun the same command: completed files are kept. If a provider is unavailable
+or all sources for a card fail, the installer lists the missing files/URLs
+and exits with code 2. It does not report a partial download as complete.
+
+Optional selections (omit them to download everything):
+
+   python -m spirit.tools.install_recent_card_art swsh
+   python -m spirit.tools.install_recent_card_art mega
+   python -m spirit.tools.install_recent_card_art BW6 BW11
+   python -m spirit.tools.install_recent_card_art SWSH_Energy
+   python -m spirit.tools.install_recent_card_art MEE SVE
+
+Use --workers 4 to reduce simultaneous downloads on a slow connection.
+Use --overwrite only if you intentionally want to replace existing artwork.
+
+IMPORTANT: This command installs card face images only. It does not install
+the PTCGO client, original menu artwork, native foil masks/textures or original
+Unity AssetBundles. For those original assets, use Option B. Card scans alone
+do not recreate the original foil effects.
+
+OPTION B: Import the original bundles (Windows PowerShell)
+--------------------------------------------------------------
+
+Stop the server before importing or refreshing assets. Restart it afterward
+to rebuild the affected bundles, then reconnect the clients.
+
+1. Open PowerShell in the CompletePTCGO repository directory.
+
+2. Activate the virtual environment:
+
+   .\venv\Scripts\Activate.ps1
+
+3. Point CompletePTCGO to your bundles directory.
+   Replace the example path with the real location on your computer:
+
+   $env:PTCGO_ART_SOURCE_DIR = "D:\path\to\cbrew bundles"
+   $env:PTCGO_CACHE_DIR = $env:PTCGO_ART_SOURCE_DIR
+
+4. Import the original card and menu artwork:
+
+   python -m spirit.tools.ptcgo_local_assets --source "$env:PTCGO_ART_SOURCE_DIR"
+
+   Use --cards-only to import only card artwork, or --ui-only to import only
+   the original menus and interface bundles.
+
+   Sword & Shield Black Star Promos also import their exact native foil masks
+   automatically (including --cards-only). Missing masks are not substituted.
+   To refresh their artwork and foils, then download absent English artwork:
+
+   python -m spirit.tools.install_recent_card_art swshp --cbrew-source "$env:PTCGO_ART_SOURCE_DIR"
+
+   The six novelty promos marked "This card cannot be used at official
+   tournaments" are excluded from the catalog and all artwork/mask imports.
+   Foil files remain local; they are not distributed through GitHub.
+
+   Radiant Collection artwork and available original foil masks are included
+   automatically, for both Legendary Treasures and Generations. The importer
+   maps printed RC numbers to the original client's numeric texture slots.
+   To refresh only these cards and masks, use:
+
+   python -m spirit.tools.ptcgo_local_assets --source "$env:PTCGO_ART_SOURCE_DIR" --radiant-only
+
+   Keep both BW Cache.zip and SM Cache.zip when available: some original
+   masks exist only in the older snapshot. Missing masks are not synthesized.
+
+   The 14 Premium Trainer's XY Collection prints also import their exact
+   alternate-art foil masks automatically (including with --cards-only).
+   Regular-print masks are NOT substituted for missing alternate-art masks.
+   For an existing installation, refresh only those masks with:
+
+   python -m spirit.tools.ptcgo_local_assets --source "$env:PTCGO_ART_SOURCE_DIR" --premium-xy-only
+
+   This replaces outdated masks for those 14 prints and removes their stale
+   regular/reverse copies, without changing the original regular prints.
+   Missing exact masks are listed; the targeted command exits with code 2
+   if the cache is absent or incomplete. --ui-only does not install foils.
+
+5. Download card artwork. (requires an internet connection):
+
+   python -m spirit.tools.install_recent_card_art
+
+   This preserves existing images and downloads missing artwork. It
+   includes older sets with incomplete cbrew coverage, such as Dragons Exalted
+   (BW6), any Radiant Collection art absent from your archive, as well the modern
+   sets after ptcgo.
+
+6. Start the server:
+
+   python -m spirit.main
+
+Generated files
+---------------
+
+The importer writes local files to these directories:
+
+   spirit/assets/cards/
+   spirit/assets/externalCache/
+   spirit/assets/bundleCache/
+
+These directories are intentionally excluded from Git. Do not commit their
+contents.
+
+Troubleshooting
+---------------
+
+- "PTCGO asset directory does not exist": verify the path assigned to
+  PTCGO_ART_SOURCE_DIR.
+- Missing old or recent card art: run the card-art command in Option A.
+  No bundle import is required. A failed source is reported in the terminal;
+  rerun later if an image provider is temporarily unavailable.
+- Missing menus: verify that SM Cache.zip or BW Cache.zip is available and run
+  the importer without --cards-only.
+- Never install the generated server certificate into the Windows Trusted Root
+  Store; the original client can reject it because of its IP hostname check.

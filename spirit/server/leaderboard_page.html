@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GLC Leaderboard</title>
+<style>
+  :root {
+    --bg: #f4f5f7; --card: #ffffff; --text: #1d2330; --muted: #6b7280;
+    --line: #e5e7eb; --accent: #2563eb; --gold: #b7791f; --silver: #6b7280; --bronze: #9c4a1a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #11141a; --card: #1a1f29; --text: #e8ebf1; --muted: #9aa3b2;
+      --line: #2a3140; --accent: #6ea0ff; --gold: #f2c14e; --silver: #c0c6d0; --bronze: #d98b5f;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { max-width: 1100px; margin: 0 auto; padding: 28px 16px 8px; }
+  h1 { margin: 0 0 4px; font-size: 26px; }
+  .sub { color: var(--muted); font-size: 13px; }
+  main { max-width: 1100px; margin: 0 auto; padding: 12px 16px 40px;
+         display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; }
+  h2 { margin: 0 0 2px; font-size: 17px; }
+  .note { color: var(--muted); font-size: 12px; margin-bottom: 10px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { padding: 7px 4px; text-align: right; border-bottom: 1px solid var(--line);
+           font-variant-numeric: tabular-nums; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  th:nth-child(2), td:nth-child(2) { text-align: left; }
+  td:nth-child(2) { max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  tr:last-child td { border-bottom: 0; }
+  td.rank { width: 30px; text-align: left; color: var(--muted); font-weight: 600; }
+  tr.r1 td.rank { color: var(--gold); } tr.r2 td.rank { color: var(--silver); } tr.r3 td.rank { color: var(--bronze); }
+  td.hi { color: var(--accent); font-weight: 700; }
+  .empty { color: var(--muted); padding: 10px 0; }
+  footer { max-width: 1100px; margin: 0 auto; padding: 0 16px 30px; color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>GLC Leaderboard</h1>
+  <div class="sub" id="status">Loading…</div>
+</header>
+<main>
+  <section>
+    <h2>Most wins</h2>
+    <div class="note">All-time wins against other players</div>
+    <table><thead><tr><th>#</th><th>Player</th><th>Wins</th><th>Played</th><th>Win %</th></tr></thead>
+      <tbody id="top_wins"></tbody></table>
+  </section>
+  <section>
+    <h2>Best win rate</h2>
+    <div class="note" id="rate_note">Players with enough games</div>
+    <table><thead><tr><th>#</th><th>Player</th><th>Win %</th><th>Wins</th><th>Played</th></tr></thead>
+      <tbody id="best_win_rate"></tbody></table>
+  </section>
+  <section>
+    <h2>Most active</h2>
+    <div class="note">Most games played against other players</div>
+    <table><thead><tr><th>#</th><th>Player</th><th>Played</th><th>Wins</th><th>Win %</th></tr></thead>
+      <tbody id="most_active"></tbody></table>
+  </section>
+</main>
+<header><h1 style="font-size:21px">Deck statistics</h1>
+  <div class="sub" id="deck_status">Games played by every saved deck since it was last edited</div></header>
+<main>
+  <section>
+    <h2>Deck types</h2>
+    <div class="note">Games and wins by each deck's Pokémon type</div>
+    <table><thead><tr><th>#</th><th>Type</th><th>Games</th><th>Share</th><th>Win %</th></tr></thead>
+      <tbody id="by_type"></tbody></table>
+  </section>
+  <section>
+    <h2>Most played Pokémon</h2>
+    <div class="note">Games played by decks that include the card</div>
+    <table><thead><tr><th>#</th><th>Card</th><th>Games</th><th>Decks</th><th>Win %</th></tr></thead>
+      <tbody id="top_pokemon"></tbody></table>
+  </section>
+  <section>
+    <h2>Most played Trainers</h2>
+    <div class="note">Games played by decks that include the card</div>
+    <table><thead><tr><th>#</th><th>Card</th><th>Games</th><th>Decks</th><th>Win %</th></tr></thead>
+      <tbody id="top_trainers"></tbody></table>
+  </section>
+  <section>
+    <h2>Most played Special Energy</h2>
+    <div class="note">Games played by decks that include the card</div>
+    <table><thead><tr><th>#</th><th>Card</th><th>Games</th><th>Decks</th><th>Win %</th></tr></thead>
+      <tbody id="top_special_energy"></tbody></table>
+  </section>
+</main>
+<footer>Updates automatically every minute. Only games between players count; bot games and guest accounts don't. Deck statistics use each deck's games since its last edit, so they match the cards it holds now.</footer>
+<script>
+  var COLUMNS = {
+    top_wins: [["wins", true], ["played"], ["win_rate", false, "%"]],
+    best_win_rate: [["win_rate", true, "%"], ["wins"], ["played"]],
+    most_active: [["played", true], ["wins"], ["win_rate", false, "%"]],
+    by_type: [["games", true], ["share", false, "%"], ["win_rate", false, "%"]],
+    top_pokemon: [["games", true], ["decks"], ["win_rate", false, "%"]],
+    top_trainers: [["games", true], ["decks"], ["win_rate", false, "%"]],
+    top_special_energy: [["games", true], ["decks"], ["win_rate", false, "%"]]
+  };
+  var LABEL = { by_type: "type", top_pokemon: "card", top_trainers: "card", top_special_energy: "card" };
+  function cell(text, cls) {
+    var td = document.createElement("td");
+    td.textContent = text;
+    if (cls) td.className = cls;
+    return td;
+  }
+  function fill(id, rows) {
+    var body = document.getElementById(id);
+    body.textContent = "";
+    if (!rows || !rows.length) {
+      var tr = document.createElement("tr");
+      var td = cell("No games recorded yet.", "empty");
+      td.colSpan = 5;
+      tr.appendChild(td);
+      body.appendChild(tr);
+      return;
+    }
+    rows.forEach(function (p, i) {
+      var tr = document.createElement("tr");
+      if (i < 3) tr.className = "r" + (i + 1);
+      tr.appendChild(cell(String(i + 1), "rank"));
+      tr.appendChild(cell(p[LABEL[id] || "player"]));
+      COLUMNS[id].forEach(function (c) {
+        var v = p[c[0]];
+        if (c[2] === "%") v = (Math.round(v * 10) / 10).toFixed(1) + "%";
+        tr.appendChild(cell(String(v), c[1] ? "hi" : ""));
+      });
+      body.appendChild(tr);
+    });
+  }
+  function load() {
+    fetch("/leaderboard.json", { cache: "no-store" })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        fill("top_wins", d.top_wins);
+        fill("best_win_rate", d.best_win_rate);
+        fill("most_active", d.most_active);
+        ["by_type", "top_pokemon", "top_trainers", "top_special_energy"].forEach(function (k) {
+          fill(k, d[k]);
+        });
+        if (d.min_games_for_win_rate)
+          document.getElementById("rate_note").textContent =
+            "Players with at least " + d.min_games_for_win_rate + " games";
+        var when = d.updated ? new Date(d.updated * 1000).toLocaleTimeString() : "";
+        document.getElementById("status").textContent =
+          (d.total_players || 0) + " players · " + (d.total_games || 0) +
+          " games recorded" + (when ? " · updated " + when : "");
+      })
+      .catch(function () {
+        document.getElementById("status").textContent = "Couldn't reach the server — retrying…";
+      });
+  }
+  load();
+  setInterval(load, 60000);
+</script>
+</body>
+</html>

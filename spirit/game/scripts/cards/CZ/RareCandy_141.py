@@ -1,0 +1,77 @@
+from spirit.game.data_utils import ItemCardDef, evolves_from
+from spirit.game.attributes import Rarities, AttrID, PokemonStage
+from spirit.game.session.effects import is_basic_pokemon, is_pokemon_card
+
+
+def _stage2_matches(hand_cards, logic_name):
+    return [
+        c for c in hand_cards
+        if is_pokemon_card(c)
+        and c.get_attribute(AttrID.STAGE) == PokemonStage.STAGE2.value
+        and evolves_from(c.archetype_id, logic_name)
+    ]
+
+
+def _turn_eligible_basics(board, player_id):
+    turn_state = getattr(board, "turn_state", None)
+    if turn_state is None:
+        return []
+    return [
+        p for p in board.pokemon_in_play(player_id)
+        if is_basic_pokemon(p) and turn_state.may_evolve_target(p.entity_id)
+    ]
+
+
+def _rare_candy_targets(board, player_id):
+    hand = board.find_player_area(player_id, "hand")
+    hand_cards = hand.children if hand is not None else []
+    targets = []
+    from spirit.game.session.passives import hand_evolution_blocked
+    hand_cards = [c for c in hand_cards
+                  if not hand_evolution_blocked(board, player_id, c)]
+    for pokemon in _turn_eligible_basics(board, player_id):
+        logic_name = pokemon.get_attribute(AttrID.EVOLUTION_LOGIC_NAME)
+        if logic_name and _stage2_matches(hand_cards, logic_name):
+            targets.append(pokemon)
+    return targets
+
+
+def _rare_candy_condition(board, player_id):
+    return bool(_rare_candy_targets(board, player_id))
+
+
+async def _rare_candy(ctx):
+    """Choose a Basic Pokemon in play; if you have a Stage 2 in hand that evolves from it, put that card onto it, skipping the Stage 1."""
+    candidates = _rare_candy_targets(ctx.board, ctx.player_id)
+    if not candidates:
+        return
+    target = await ctx.choose_pokemon(candidates, "Choose a Basic Pokémon in play")
+    if target is None:
+        return
+    logic_name = target.get_attribute(AttrID.EVOLUTION_LOGIC_NAME)
+    from spirit.game.session.passives import hand_evolution_blocked
+    stage2_hand = [c for c in (_stage2_matches(ctx.hand(), logic_name) if logic_name else [])
+                   if not hand_evolution_blocked(ctx.board, ctx.player_id, c)]
+    if not stage2_hand:
+        return
+    picks = await ctx.choose_cards(
+        stage2_hand, 1, prompt="Choose a Stage 2 Pokémon to evolve into",
+    )
+    if not picks:
+        return
+    await ctx.evolve_pokemon(target, picks[0])
+
+
+card = ItemCardDef(
+    guid="963902d0-48a5-507a-ae11-816234a0cd76",
+    key="CZ",
+    name="com.direwolfdigital.cake.data.archetypes.trainer.RareCandy.Name",
+    display_name="Rare Candy",
+    searchable_by=["Rare Candy", "Item"],
+    subtypes=["Item"],
+    collector_number=141,
+    set_code="CZ",
+    rarity=Rarities.Uncommon,
+    effect=_rare_candy,
+    condition=_rare_candy_condition,
+)

@@ -1,0 +1,1400 @@
+"""Legal-action computation for the main turn loop.
+
+Builds the targetMap of a SelectionWithTargetsAndActionsRequired offer; the
+client highlights exactly those entities (it does no legality checks itself).
+"""
+
+import logging
+import re
+import uuid
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+from spirit.game.attributes import (
+    AttrID,
+    CLIENT_SPECIAL_CONDITION_NAMES,
+    PokemonStage,
+    PokemonTypes,
+    POKEMON_TYPES_BY_CLIENT_NAME,
+    SpecialConditions,
+    TrainerType,
+)
+from spirit.game.data_utils import ABILITIES_BY_ID, Activations, def_for, subtypes_for
+from spirit.game.legend import complementary_halves
+from spirit.game.models.board import (
+    BoardState,
+    EnergyEntity,
+    PokemonEntity,
+    TrainerEntity,
+)
+from .constants import (
+    PROMPT_RETREAT_COST,
+    PROMPT_RETREAT_NEW_ACTIVE,
+    SelectionKind,
+)
+from .passives import (
+    ability_locked,
+    attacks_blocked,
+    out_of_play_ability_locked,
+    can_attack_despite_conditions,
+    can_attack_on_first_turn,
+    can_retreat_despite_conditions,
+    can_evolve_early,
+    can_evolve_onto,
+    can_evolve_same_turn,
+    effective_attack_cost,
+    effective_bench_capacity,
+    effective_retreat_cost,
+    effective_supporter_limit,
+    extra_manual_energy_attachments,
+    energy_attachment_blocked,
+    energy_provided_options,
+    evolution_blocked,
+    pokemon_play_blocked,
+    retreat_blocked,
+    tool_slots_free,
+    trainer_play_blocked,
+)
+
+
+# Semantic action names from the client's Actions enum / SelectableActionUtil.
+ACTION_PLAY_POKEMON = "DefaultPokemonPlayAbility"
+ACTION_EVOLVE = "EvolvePokemonPlayAbility"
+ACTION_PLAY_ENERGY = "DefaultEnergyPlayAbility"
+ACTION_USE_TRAINER = "UseTrainerCard"
+ACTION_PLAY_STADIUM = "DefaultStadiumPlayAbility"
+ACTION_USE_ABILITY = "UsePokemonAbility"
+ACTION_USE_ATTACK = "UsePokemonAttack"
+ACTION_RETREAT = "BaseRetreat"
+# No dedicated tool member exists in the client's Actions enum; the string is
+# free-form (only the action-panel icon lookup reads it) and the drop target
+# comes from the target node's validTargets, exactly like energy.
+ACTION_ATTACH_TOOL = "DefaultToolPlayAbility"
+
+# Conditions that stop the Active from attacking or retreating.
+_IMMOBILIZING_CONDITIONS = {
+    CLIENT_SPECIAL_CONDITION_NAMES[SpecialConditions.ASLEEP],
+    CLIENT_SPECIAL_CONDITION_NAMES[SpecialConditions.PARALYZED],
+}
+
+# ActionsNode Kind: "Ability" (j.V) auto-resolves plays; "AbilitySelection" (K.O) opens the ability panel.
+SELECTION_TYPE_PLAY = SelectionKind.ABILITY.value
+SELECTION_TYPE_PANEL = SelectionKind.ABILITY_SELECTION.value
+
+# Energy cost types that any energy card can pay.
+_WILDCARD_COST_TYPES = (PokemonTypes.NO_COLOR.value, PokemonTypes.COLORLESS.value)
+
+_ACTION_ID_NAMESPACE = uuid.UUID("f6c1b1de-5e1a-4b52-9c40-1d1c4e6a7b0d")
+
+# Sentinel lock horizon: stays locked until the Pokemon leaves the Active spot.
+LOCK_UNTIL_LEAVES_ACTIVE = 10 ** 9
+
+
+def action_id_for(entity_id: str, verb: str) -> str:
+    """Deterministic GUID action ID (must be a GUID: the client runs new Guid(id))."""
+    return str(uuid.uuid5(_ACTION_ID_NAMESPACE, f"{entity_id}:{verb}"))
+
+
+class EffectExpiry(int):
+    """A turn deadline retaining its source without changing numeric consumers."""
+
+    def __new__(cls, value, from_attack=True):
+        result = super().__new__(cls, value)
+        result.from_attack = from_attack
+        return result
+
+
+@dataclass
+class TurnState:
+    """Per-game turn bookkeeping consumed by the legality rules."""
+
+    turn_number: int = 0
+    active_player_id: Optional[str] = None
+    supporter_played: bool = False
+    supporters_played: int = 0
+    supporter_limit_this_turn: int = 1
+    # A player may play only 1 Stadium per turn, the same way they may
+    # play only 1 Supporter. Set even when the Stadium never reaches the
+    # board (Chaotic Swell sweeps it): playing it is what spends the turn's
+    # allowance, not it staying in play.
+    stadium_played: bool = False
+    energy_attached: bool = False
+    energy_attachments_this_turn: int = 0
+    attached_energy_entity_ids: List[str] = field(default_factory=list)
+    bonus_energy_target_id: Optional[str] = None
+    # player_id -> turn number on which that player may attach any number of
+    # Energy cards from hand (Dragonair's Dragon's Wish: "during your next turn").
+    unlimited_energy_turn: Dict[str, int] = field(default_factory=dict)
+    retreated: bool = False
+    # entity_id -> turn number it entered play (or last evolved). Entities
+    # placed during setup are absent and default to turn 0.
+    entered_play_turn: Dict[str, int] = field(default_factory=dict)
+    # Every card of a stack that evolved this turn: a Pokemon evolves at most
+    # once per turn, even after Devolution Spray strips the new stage.
+    evolved_this_turn: Dict[str, int] = field(default_factory=dict)
+    # (entity_id, ability_id) pairs used this turn (once-per-turn abilities).
+    used_abilities: Set[Tuple[str, str]] = field(default_factory=set)
+    # Ability names used this turn that are "1 per turn" shared across copies
+    # (Dark Asset, Flower Selecting, Dragon's Hoard).
+    used_named_abilities: Set[str] = field(default_factory=set)
+    # Players who already used their once-per-game VSTAR Power.
+    vstar_used: Set[str] = field(default_factory=set)
+    # Players who already used their once-per-game GX attack.
+    gx_used: Set[str] = field(default_factory=set)
+    # V-UNION is a once-per-game play rule, independently for each owner/name.
+    vunion_played: Set[Tuple[str, str]] = field(default_factory=set)
+    # Bonnie permits only the named Pokemon to reuse GX, for this turn.
+    gx_repeat_names_this_turn: Dict[str, Set[str]] = field(default_factory=dict)
+    # Players forbidden from declaring GX attacks for the rest of the game
+    # (Clear Vision-GX). This is distinct from spending one's own GX token.
+    gx_locked_players: Set[str] = field(default_factory=set)
+    attack_gx_locked_players: Set[str] = field(default_factory=set)
+    # player_id -> (forced result, last affected turn). Sinister Suggestion
+    # applies to every flip made by the opponent during their next turn.
+    forced_coins_through_turn: Dict[str, Tuple[bool, int]] = field(
+        default_factory=dict
+    )
+    # player_id -> (last affected turn, source title). Dizzying Wind makes
+    # every Trainer played by that player during their next turn require a
+    # coin flip; tails discards the Trainer without resolving its effect.
+    trainer_flip_checks: Dict[str, Tuple[int, str]] = field(default_factory=dict)
+    # entity_id -> (last affected turn, source title). Lazy Howl ends the
+    # opponent's turn when an Energy is manually attached to the marked
+    # Defending Pokemon while it remains Active.
+    attach_ends_turn_checks: Dict[str, Tuple[int, str]] = field(default_factory=dict)
+    # (entity_id, ability_id) -> last turn number the attack stays locked
+    # ("during your next turn, this Pokemon can't use ...").
+    attack_locks: Dict[Tuple[str, str], int] = field(default_factory=dict)
+    # entity_id -> last turn number retreat stays locked ("the Defending
+    # Pokemon can't retreat"); LOCK_UNTIL_LEAVES_ACTIVE = until it leaves.
+    retreat_locks: Dict[str, int] = field(default_factory=dict)
+    # Turn-scoped attacker-side damage boosts (Power Tablet); pruned by
+    # expires_after_turn each begin_turn (None = this turn only).
+    damage_modifiers: List[Any] = field(default_factory=list)
+    # Hex Maniac: all Pokemon Abilities are suppressed through the opponent's
+    # next turn, including cards in hands/discards and cards entering play.
+    abilities_disabled_through_turn: int = 0
+    # Pokémon whose Abilities that Hex Maniac could not touch: its effects
+    # were prevented for them when it was played (Ribombee's Mysterious Buzz
+    # shielding your Fairy Pokémon in play).
+    abilities_disabled_exempt: Set[str] = field(default_factory=set)
+    # --- two-turn history ledgers, rotated this-turn -> last-turn ---
+    # (archetype_id, display_name, trainer_type) per trainer/stadium played.
+    trainers_played: List[Tuple[str, str, int]] = field(default_factory=list)
+    # (entity_id, archetype_id, attack_title) per declared attack.
+    attacks_used: List[Tuple[str, str, str]] = field(default_factory=list)
+    # victim owner player_id -> [{archetype_id, subtypes}] for attack KOs.
+    kos_by_attack: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
+    # entity_id -> damage dealt to it by the other side this turn.
+    damage_taken: Dict[str, int] = field(default_factory=dict)
+    # player_id -> prize cards taken this turn.
+    prizes_taken: Dict[str, int] = field(default_factory=dict)
+    retreated_entities: Set[str] = field(default_factory=set)
+    healed_entities: Set[str] = field(default_factory=set)
+    tools_attached_from_hand: Set[str] = field(default_factory=set)
+    active_attack_damage_taken: Set[str] = field(default_factory=set)
+    active_attack_damage_taken_last_turn: Set[str] = field(default_factory=set)
+    turn_draw_entity_ids: Set[str] = field(default_factory=set)
+    trainers_played_last_turn: List[Tuple[str, str, int]] = field(default_factory=list)
+    attacks_used_last_turn: List[Tuple[str, str, str]] = field(default_factory=list)
+    kos_by_attack_last_turn: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
+    # Checkup is between turns, not part of the turn that just ended.
+    in_checkup: bool = False
+    # All in-turn knockouts, including Ability/Trainer damage counters, keyed
+    # by the victim's owner. Checkup knockouts must never enter this ledger.
+    kos_suffered: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
+    kos_suffered_last_turn: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
+    damage_taken_last_turn: Dict[str, int] = field(default_factory=dict)
+    prizes_taken_last_turn: Dict[str, int] = field(default_factory=dict)
+    retreated_entities_last_turn: Set[str] = field(default_factory=set)
+    healed_entities_last_turn: Set[str] = field(default_factory=set)
+    turn_draw_entity_ids_last_turn: Set[str] = field(default_factory=set)
+    # entity_id -> turn it last moved into the Active spot (persistent stamp).
+    became_active_turn: Dict[str, int] = field(default_factory=dict)
+    # player_id -> [(card_predicate, expires_after_turn)] play restrictions
+    # ("your opponent can't play Item cards during their next turn"); a None
+    # expiry holds until cleared.
+    play_locks: Dict[str, List[Tuple[Any, Optional[int]]]] = field(default_factory=dict)
+    # entity_id -> last turn number energy may not be attached to it (Masquerain).
+    attach_restrictions: Dict[str, int] = field(default_factory=dict)
+    # Entities whose ON_MOVE_TO_ACTIVE trigger already fired this turn.
+    on_move_to_active_fired: Set[str] = field(default_factory=set)
+    # Whether the turn player used their once-per-turn attack-coin re-flip
+    # (Glimwood Tangle); only actually re-flipping consumes it.
+    attack_coin_reroll_used: bool = False
+    # Will fixes the first result of the next attack/Ability/Trainer coin event.
+    forced_coin_result: Optional[bool] = None
+    # entity_id -> (through_turn, flip_title): a Smokescreen-family check --
+    # this entity must flip a coin to attack, tails cancels the attack.
+    attack_flip_checks: Dict[str, Tuple[int, str]] = field(default_factory=dict)
+    # Entities whose attacks ignore effects on the opponent's Active THIS turn
+    # (Phoebe); cleared every begin_turn.
+    ignore_target_effects_entities: Set[str] = field(default_factory=set)
+    ignore_target_effects_subtypes: Dict[str, Set[str]] = field(default_factory=dict)
+    # player_id -> attack titles that player declared on THEIR previous turn
+    # ("If 1 of your Pokemon used Yoga Loop during your last turn...").
+    attack_titles_prev_turn_by_player: Dict[str, List[str]] = field(default_factory=dict)
+    attacks_prev_turn_by_player: Dict[str, List[Tuple[str, str, str]]] = field(default_factory=dict)
+    # This-turn bonus-prize watches (Sky Seal Stone's Star Order):
+    # {player_id, attacker_predicate, target_predicate, prizes}; consulted by
+    # resolve_knockouts on attack-damage KOs, cleared every begin_turn.
+    extra_prize_watchers: List[Dict[str, Any]] = field(default_factory=list)
+    # After a keep-turn attack (Festival Lead / Fluffy Barrage), Yes on the
+    # second-attack prompt stamps the attacker here so the next main offer
+    # auto-selects it and opens the attack panel.
+    auto_select_attack_entity_id: Optional[str] = None
+
+    def pokemon_lost_last_turn(self, player_id: str) -> List[Dict[str, Any]]:
+        """"if any of your Pokemon were Knocked Out during your opponent's
+        last turn" -- every in-turn knockout, whatever caused it.
+
+        The one place that decides which ledger that sentence means. Text
+        that instead says "by damage from an opponent's attack" (Dhelmise V,
+        Kangaskhan) reads kos_by_attack_last_turn directly.
+        """
+        return (self.kos_suffered_last_turn or {}).get(player_id, [])
+
+    def can_repeat_gx(self, player_id: str, pokemon) -> bool:
+        definition = def_for(getattr(pokemon, "archetype_id", ""))
+        name = (getattr(definition, "display_name", "") or "").casefold()
+        return name in self.gx_repeat_names_this_turn.get(player_id, set())
+
+    def begin_turn(self, player_id: str, board: Optional[Any] = None):
+        """Advances to the next turn, resets the once-per-turn flags, rotates
+        the two-turn history, and prunes expired turn-scoped effects.
+
+        A second turn in a row for the same player (Dialga-GX's Timeless GX)
+        leaves the knockout ledgers where they are. The opponent has not had a
+        turn in between, so "Knocked Out during your opponent's last turn"
+        still means the turn it meant a moment ago, and Dance of Tribute /
+        Flip the Script stay usable through the extra turn.
+        """
+        extra_turn = bool(self.active_player_id) and self.active_player_id == player_id
+        if self.active_player_id:
+            self.attacks_prev_turn_by_player[self.active_player_id] = list(self.attacks_used)
+            self.attack_titles_prev_turn_by_player[self.active_player_id] = [
+                title for _, _, title in self.attacks_used
+            ]
+        self.turn_number += 1
+        self.active_player_id = player_id
+        self.supporter_played = False
+        self.supporters_played = 0
+        self.supporter_limit_this_turn = 1
+        self.stadium_played = False
+        self.energy_attached = False
+        self.energy_attachments_this_turn = 0
+        self.attached_energy_entity_ids.clear()
+        self.bonus_energy_target_id = None
+        self.retreated = False
+        self.used_abilities = set()
+        self.used_named_abilities = set()
+        self.gx_repeat_names_this_turn.clear()
+        self.damage_modifiers = [
+            m for m in self.damage_modifiers
+            if getattr(m, "expires_after_turn", None) is not None
+            and m.expires_after_turn >= self.turn_number
+        ]
+        self.trainers_played_last_turn = self.trainers_played
+        self.trainers_played = []
+        self.attacks_used_last_turn = self.attacks_used
+        self.attacks_used = []
+        if not extra_turn:
+            self.kos_by_attack_last_turn = self.kos_by_attack
+            self.kos_by_attack = {}
+            self.kos_suffered_last_turn = self.kos_suffered
+            self.kos_suffered = {}
+        self.damage_taken_last_turn = self.damage_taken
+        self.damage_taken = {}
+        self.prizes_taken_last_turn = self.prizes_taken
+        self.prizes_taken = {}
+        self.retreated_entities_last_turn = self.retreated_entities
+        self.retreated_entities = set()
+        self.healed_entities_last_turn = self.healed_entities
+        self.healed_entities = set()
+        self.tools_attached_from_hand = set()
+        self.active_attack_damage_taken_last_turn = self.active_attack_damage_taken
+        self.active_attack_damage_taken = set()
+        self.turn_draw_entity_ids_last_turn = self.turn_draw_entity_ids
+        self.turn_draw_entity_ids = set()
+        self.on_move_to_active_fired = set()
+        self.attack_coin_reroll_used = False
+        self.forced_coin_result = None
+        self.forced_coins_through_turn = {
+            pid: entry for pid, entry in self.forced_coins_through_turn.items()
+            if entry[1] >= self.turn_number
+        }
+        self.trainer_flip_checks = {
+            pid: entry for pid, entry in self.trainer_flip_checks.items()
+            if entry[0] >= self.turn_number
+        }
+        self.attach_ends_turn_checks = {
+            eid: entry for eid, entry in self.attach_ends_turn_checks.items()
+            if entry[0] >= self.turn_number
+        }
+        self.play_locks = {
+            pid: kept for pid, locks in self.play_locks.items()
+            if (kept := [(p, exp) for p, exp in locks
+                         if exp is None or exp >= self.turn_number])
+        }
+        self.attach_restrictions = {
+            eid: exp for eid, exp in self.attach_restrictions.items()
+            if exp >= self.turn_number
+        }
+        self.attack_flip_checks = {
+            eid: entry for eid, entry in self.attack_flip_checks.items()
+            if entry[0] >= self.turn_number
+        }
+        self.ignore_target_effects_entities = set()
+        self.ignore_target_effects_subtypes = {}
+        self.extra_prize_watchers = []
+        self.auto_select_attack_entity_id = None
+        if board is not None:
+            board.temporary_passives = [
+                tp for tp in (getattr(board, "temporary_passives", None) or [])
+                if tp.expires_after_turn is None
+                or tp.expires_after_turn >= self.turn_number
+            ]
+
+    def mark_entered_play(self, entity_id: str):
+        self.entered_play_turn[entity_id] = self.turn_number
+
+    def lock_attack(self, entity_id: str, ability_id: str,
+                    through_turn: Optional[int] = None, *, from_attack=True):
+        """Locks an attack through its user's next turn by default.
+
+        The default lock starts NEXT turn: "can't use <attack> during your
+        next turn" doesn't stop a second use this turn (Barrage Ancient
+        Trait -- owner report Oct 15, Medicham + Relicanth using Meditite's
+        Spirited Headbutt twice)."""
+        expiry = EffectExpiry(
+            self.turn_number + 2 if through_turn is None else through_turn, from_attack
+        )
+        if through_turn is None:
+            expiry.locked_from = self.turn_number + 1
+        self.attack_locks[(entity_id, ability_id)] = expiry
+
+    def require_trainer_flip(self, player_id: str, title: str = "", *, from_attack=True):
+        self.trainer_flip_checks[player_id] = (EffectExpiry(self.turn_number + 1, from_attack), title)
+
+    def require_attach_ends_turn(self, entity_id: str, title: str = "", *, from_attack=True):
+        self.attach_ends_turn_checks[entity_id] = (EffectExpiry(self.turn_number + 1, from_attack), title)
+
+    def attack_locked(self, entity_id: str, ability_id: str) -> bool:
+        expiry = self.attack_locks.get((entity_id, ability_id), 0)
+        return getattr(expiry, "locked_from", 0) <= self.turn_number <= expiry
+
+    def lock_retreat(self, entity_id: str, through_turn: Optional[int] = None, *, from_attack=True):
+        """Blocks retreat through `through_turn` (default: the opponent's next turn)."""
+        self.retreat_locks[entity_id] = EffectExpiry(
+            self.turn_number + 1 if through_turn is None else through_turn, from_attack
+        )
+
+    def retreat_locked(self, entity_id: str) -> bool:
+        return self.turn_number <= self.retreat_locks.get(entity_id, 0)
+
+    def lock_plays(self, player_id: str, predicate, through_turn: Optional[int] = None, *, from_attack=True):
+        """Forbids `player_id` playing hand cards matching `predicate`
+        (default: through their next turn)."""
+        self.play_locks.setdefault(player_id, []).append(
+            (predicate, EffectExpiry(self.turn_number + 1 if through_turn is None else through_turn, from_attack))
+        )
+
+    def play_locked(self, player_id: str, card: Any) -> bool:
+        return any(
+            (exp is None or self.turn_number <= exp) and pred(card)
+            for pred, exp in self.play_locks.get(player_id, [])
+        )
+
+    def restrict_attachments(self, entity_id: str, through_turn: Optional[int] = None, *, from_attack=True):
+        """Forbids energy attachments onto `entity_id` (default: through the
+        opponent's next turn)."""
+        self.attach_restrictions[entity_id] = EffectExpiry(
+            self.turn_number + 1 if through_turn is None else through_turn, from_attack
+        )
+
+    def attach_restricted(self, entity_id: str) -> bool:
+        return self.turn_number <= self.attach_restrictions.get(entity_id, -1)
+
+    def set_attack_flip_check(self, entity_id: str, through_turn: Optional[int] = None,
+                              title: str = "", *, from_attack=True, coins: int = 1):
+        """Requires a coin flip before `entity_id` attacks (tails = the attack
+        doesn't happen); default lifetime: through the opponent's next turn."""
+        self.attack_flip_checks[entity_id] = (
+            EffectExpiry(self.turn_number + 1 if through_turn is None else through_turn, from_attack),
+            title,
+            coins,
+        )
+
+    def attack_flip_coins(self, entity_id: str) -> int:
+        """How many coins the Smokescreen-family check flips (Sticky
+        Smokescreen / Jet of Ink: 2, and every one must be heads)."""
+        entry = self.attack_flip_checks.get(entity_id)
+        return entry[2] if entry is not None and len(entry) > 2 else 1
+
+    def attack_flip_check(self, entity_id: str) -> Optional[str]:
+        """The flip title when `entity_id` must flip to attack this turn, else None."""
+        entry = self.attack_flip_checks.get(entity_id)
+        if entry is not None and self.turn_number <= entry[0]:
+            return entry[1]
+        return None
+
+    def has_attack_effects(self, players, pokemon_ids):
+        """Whether Ranger/Channeler can remove a live ongoing attack effect."""
+        def live(expiry):
+            return getattr(expiry, 'from_attack', False) and expiry >= self.turn_number
+
+        for name in ('retreat_locks', 'attach_restrictions'):
+            if any(key in pokemon_ids and live(exp) for key, exp in getattr(self, name).items()):
+                return True
+        if any(key[0] in pokemon_ids and live(exp) for key, exp in self.attack_locks.items()):
+            return True
+        for name, targets, index in (
+            ('attack_flip_checks', pokemon_ids, 0),
+            ('attach_ends_turn_checks', pokemon_ids, 0),
+            ('trainer_flip_checks', players, 0),
+            ('forced_coins_through_turn', players, 1),
+        ):
+            if any(key in targets and live(value[index]) for key, value in getattr(self, name).items()):
+                return True
+        if any(pid in players and live(exp) for pid, entries in self.play_locks.items()
+               for _, exp in entries):
+            return True
+        if self.attack_gx_locked_players & set(players):
+            return True
+        if any(getattr(mod, 'from_attack', False) and mod.player_id in players
+               and (mod.expires_after_turn is None or mod.expires_after_turn >= self.turn_number)
+               and (mod.source_entity_id is None or mod.source_entity_id in pokemon_ids)
+               for mod in self.damage_modifiers):
+            return True
+        return any(entry.get('from_attack', False) and entry['player_id'] in players
+                   for entry in self.extra_prize_watchers)
+
+    def remove_attack_effects(self, players, pokemon_ids):
+        """Ranger/Channeler remove ongoing effects, not damage, conditions or history."""
+        def attack(expiry):
+            return getattr(expiry, 'from_attack', False)
+
+        for name in ('retreat_locks', 'attach_restrictions'):
+            entries = getattr(self, name)
+            setattr(self, name, {key: value for key, value in entries.items()
+                                if key not in pokemon_ids or not attack(value)})
+        self.attack_locks = {key: exp for key, exp in self.attack_locks.items()
+                             if key[0] not in pokemon_ids or not attack(exp)}
+        for name, targets, index in (
+            ('attack_flip_checks', pokemon_ids, 0),
+            ('attach_ends_turn_checks', pokemon_ids, 0),
+            ('trainer_flip_checks', players, 0),
+            ('forced_coins_through_turn', players, 1),
+        ):
+            entries = getattr(self, name)
+            setattr(self, name, {key: value for key, value in entries.items()
+                                if key not in targets or not attack(value[index])})
+        self.play_locks = {
+            pid: kept for pid, entries in self.play_locks.items()
+            if (kept := [(pred, exp) for pred, exp in entries
+                         if pid not in players or not attack(exp)])
+        }
+        removed = self.attack_gx_locked_players & set(players)
+        self.gx_locked_players.difference_update(removed)
+        self.attack_gx_locked_players.difference_update(removed)
+        self.damage_modifiers = [mod for mod in self.damage_modifiers
+                                 if not getattr(mod, 'from_attack', False)
+                                 or mod.player_id not in players]
+        self.extra_prize_watchers = [entry for entry in self.extra_prize_watchers
+                                     if not entry.get('from_attack', False)
+                                     or entry['player_id'] not in players]
+
+    def may_evolve_target(self, entity_id: str) -> bool:
+        """A Pokemon may evolve only if it has been in play since a previous
+        turn, and never during either player's first turn (turns 1 and 2)."""
+        if self.turn_number <= 2:
+            return False
+        if self.evolved_this_turn.get(entity_id) == self.turn_number:
+            return False
+        return self.entered_play_turn.get(entity_id, 0) < self.turn_number
+
+    def mark_evolved(self, entity_ids):
+        for entity_id in entity_ids:
+            self.evolved_this_turn[entity_id] = self.turn_number
+
+
+def selectable_action(
+    game_id: str,
+    action_id: str,
+    description: str,
+    selection_type: str = SELECTION_TYPE_PLAY,
+) -> Dict[str, Any]:
+    """Builds a SelectableAction wire dict."""
+    return {
+        "gameID": game_id,
+        "actionID": action_id,
+        "description": description,
+        "selectionType": selection_type,
+    }
+
+
+def entity_list_target_info(
+    valid_targets: List[str],
+    number_to_select: int = 1,
+    minimum_to_select: int = 1,
+    forced: bool = True,
+    kind: str = SelectionKind.ENTITY_LIST.value,
+) -> Dict[str, Any]:
+    """Builds an interactive EntityListTargetInformation wire dict."""
+    return {
+        "name": kind,
+        "selected": True,
+        "validTargets": valid_targets,
+        "numberToSelect": number_to_select,
+        "minimumToSelect": minimum_to_select,
+        "forced": forced,
+    }
+
+
+def _target_map_entry(
+    game_id: str,
+    entity_id: str,
+    action_id: str,
+    description: str,
+    target_infos: Optional[List[Dict[str, Any]]] = None,
+    selection_type: str = SELECTION_TYPE_PLAY,
+) -> Dict[str, Any]:
+    return {
+        "entityID": entity_id,
+        "selectableAction": selectable_action(
+            game_id, action_id, description, selection_type
+        ),
+        "targetInfoLst": target_infos or [],
+    }
+
+
+def energy_provided_count(energy: EnergyEntity, board: Optional[BoardState] = None) -> int:
+    """How much one energy card pays toward a cost (client s.y: max option
+    length); with a board, provided-modifying passives apply."""
+    options = energy_provided_options(board, energy)
+    return max((len(option) for option in options), default=1)
+
+
+def trim_energy_overpayment(energies: List[EnergyEntity], amount: int,
+                            board: Optional[BoardState] = None) -> List[EnergyEntity]:
+    """Drop picked Energy that the payment does not need.
+
+    The client's pip tray counts each card's *printed* Energy, so with a
+    provided-doubling passive (Charizard PGO's Burn Brightly) it makes the
+    player select two basic Fire Energy for "discard 2 Energy" although one
+    already provides two.  Rules-wise you only discard what the cost needs:
+    keep the player's earlier picks and release later ones while the rest
+    still pays ``amount``.
+    """
+    kept = list(energies)
+    for energy in reversed(list(energies)):
+        rest = [e for e in kept if e is not energy]
+        if rest and sum(energy_provided_count(e, board) for e in rest) >= amount:
+            kept = rest
+    return kept
+
+
+def _printed_energy_count(energy) -> int:
+    """What the legacy client's pip tray counts for one card: its printed
+    ENERGY_INFO, without provided-changing passives."""
+    info = energy.get_attribute(AttrID.ENERGY_INFO) or {}
+    if isinstance(info, str):
+        try:
+            import json as _json
+            info = _json.loads(info)
+        except ValueError:
+            info = {}
+    options = info.get("options") if isinstance(info, dict) else None
+    return max((len(option) for option in (options or [])), default=1)
+
+
+def forced_energy_payment(energies: List[EnergyEntity], amount: int,
+                          board: Optional[BoardState] = None) -> Optional[List[EnergyEntity]]:
+    """An Energy payment the server should make itself, or None to ask.
+
+    Only used when a passive changes what an Energy provides (Burn Brightly:
+    basic Fire provides two).  The client's tray still counts printed pips,
+    so it would make the player click two Fire for a cost one Fire pays.
+    Rules-wise only minimal payments are legal (no card can be dropped).
+    When every minimal payment is the same set of interchangeable cards
+    (same card, same Pokemon) there is no real choice, so pay it directly.
+    """
+    if amount <= 0 or not energies or len(energies) > 12:
+        return None
+    live = {e.entity_id: energy_provided_count(e, board) for e in energies}
+    if all(live[e.entity_id] == _printed_energy_count(e) for e in energies):
+        return None
+    from itertools import combinations
+    minimal = []
+    for size in range(1, len(energies) + 1):
+        for combo in combinations(energies, size):
+            paid = sum(live[e.entity_id] for e in combo)
+            if paid < amount:
+                continue
+            if any(paid - live[e.entity_id] >= amount for e in combo):
+                continue
+            minimal.append(combo)
+    if not minimal:
+        return None
+
+    def signature(combo):
+        return tuple(sorted(
+            ((e.archetype_id or "").lower(), getattr(e, "parent_id", None))
+            for e in combo))
+
+    if len({signature(combo) for combo in minimal}) != 1:
+        return None
+    return list(min(minimal, key=len))
+
+
+def _energy_provided_types(energy: EnergyEntity, board: Optional[BoardState] = None) -> set:
+    """The set of types one energy can provide (union of the options)."""
+    provided = set()
+    for option in energy_provided_options(board, energy):
+        provided.update(option)
+    return provided
+
+
+def attack_cost_satisfied(cost: Dict[str, int], energies: List[EnergyEntity],
+                          board: Optional[BoardState] = None) -> bool:
+    """Whether the attached energies can pay an attack's cost.
+
+    Each card pays up to its provided count (Double Turbo pays 2); typed
+    requirements consume the most type-constrained cards first, colorless
+    accepts whatever capacity remains.
+    """
+    # An Energy that provides nothing right now (Splash Energy on a non-Water
+    # Pokémon) pays for nothing, Colorless included.
+    pool = [
+        {"types": types, "count": energy_provided_count(e, board)}
+        for e in energies
+        if (types := _energy_provided_types(e, board))
+    ]
+    colorless_needed = 0
+    for type_key, count in (cost or {}).items():
+        # Wire cost keys are client enum names ("Grass"); accept legacy ints too.
+        if type_key in POKEMON_TYPES_BY_CLIENT_NAME:
+            type_val = POKEMON_TYPES_BY_CLIENT_NAME[type_key].value
+        else:
+            type_val = int(type_key)
+        if type_val in _WILDCARD_COST_TYPES:
+            colorless_needed += count
+            continue
+        for _ in range(count):
+            candidates = [p for p in pool if type_val in p["types"]]
+            if not candidates:
+                return False
+            candidates.sort(key=lambda p: len(p["types"]))
+            chosen = candidates[0]
+            chosen["count"] -= 1
+            if chosen["count"] <= 0:
+                pool.remove(chosen)
+    return sum(p["count"] for p in pool) >= colorless_needed
+
+
+def pokemon_without_tool(pokemon: Any) -> bool:
+    """A Pokemon may hold one Pokemon Tool (server rule; client has no cap)."""
+    return not any(
+        child.get_attribute(AttrID.TRAINER_TYPE) == TrainerType.POKEMON_TOOL.value
+        for child in pokemon.children
+    )
+
+
+def tool_attachment_targets(board: BoardState, player_id: str, tool) -> List[PokemonEntity]:
+    """Shared menu/execution rules; Team Flare Tool F targets opposing EX.
+
+    Tool F requires no Tool at all, even when theta Double leaves a free slot.
+    Lowercase modern ex are not the printed uppercase Pokemon-EX category.
+    """
+    definition = def_for(tool.archetype_id)
+    tool_f = 'Pokémon Tool F' in (getattr(definition, 'subtypes', None) or [])
+    attach_to = getattr(definition, 'attach_to', None)
+    owners = [pid for pid in board.player_ids if pid != player_id] if tool_f else [player_id]
+    return [pokemon for owner in owners for pokemon in board.pokemon_in_play(owner)
+            if tool_slots_free(board, pokemon) > 0
+            and (attach_to is None or attach_to(pokemon))
+            and (not tool_f or ('EX' in subtypes_for(pokemon.archetype_id)
+                               and pokemon_without_tool(pokemon)))]
+
+
+def _evolution_card_may_evolve_early(card: PokemonEntity,
+                                     target: PokemonEntity) -> bool:
+    """Consult an Ancient Trait carried by the evolution card in hand."""
+    definition = def_for(card.archetype_id)
+    passive = getattr(definition, "passive", None)
+    return bool(passive and passive.may_evolve_early(target, card))
+
+
+def evolve_targets_for(board: BoardState, state, player_id: str, card) -> List[PokemonEntity]:
+    """The Pokemon in play `card` (an Evolution card in hand) may evolve now."""
+    evolves_from = card.get_attribute(AttrID.EVOLUTION_LOGIC_FROM)
+    if not evolves_from or state is None:
+        return []
+    return [
+        p for p in board.pokemon_in_play(player_id)
+        if (p.get_attribute(AttrID.EVOLUTION_LOGIC_NAME) == evolves_from
+            or can_evolve_onto(board, p, card))
+        and not evolution_blocked(board, player_id, p, card)
+        and (state.may_evolve_target(p.entity_id)
+             or can_evolve_early(board, p)
+             or _evolution_card_may_evolve_early(card, p)
+             or (state.turn_number > 2
+                 and can_evolve_same_turn(board, p, card)))
+    ]
+
+
+def _active_immobilized(board: BoardState, player_id: str) -> bool:
+    """Asleep/Paralyzed Actives can neither attack nor retreat."""
+    active = board.active_pokemon(player_id)
+    conditions = active.get_attribute(AttrID.SPECIAL_CONDITIONS) if active else None
+    return any(c in _IMMOBILIZING_CONDITIONS for c in (conditions or []))
+
+
+def _usable_while_asleep(definition, active) -> bool:
+    """Dream Waltz / Toss and Turn / Hypno Roll: "This attack can be used
+    (even) if this Pokémon is Asleep" -- Asleep only; Paralysis still stops it."""
+    text = (getattr(definition, "game_text", "") or "").lower().replace("’", "'")
+    if not re.search(r"this attack can be used (?:even )?if this pokémon is asleep", text):
+        return False
+    conditions = active.get_attribute(AttrID.SPECIAL_CONDITIONS) or []
+    return CLIENT_SPECIAL_CONDITION_NAMES[SpecialConditions.PARALYZED] not in conditions
+
+
+def compute_legal_actions(
+    board: BoardState,
+    state: TurnState,
+    player_id: str,
+    game_id: str,
+) -> List[Dict[str, Any]]:
+    """All legal plays for the acting player, as targetMap entries."""
+    entries: List[Dict[str, Any]] = []
+
+    hand_area = board.find_player_area(player_id, "hand")
+    bench_area = board.find_player_area(player_id, "bench")
+    if not hand_area or not bench_area:
+        return entries
+
+    in_play = board.pokemon_in_play(player_id)
+    in_play_ids = [p.entity_id for p in in_play]
+    bench_has_space = len(bench_area.children) < effective_bench_capacity(board, player_id)
+
+    for card in hand_area.children:
+        if isinstance(card, PokemonEntity):
+            # Passive blocks, and attack locks such as Chimecho's Bell of
+            # Silence ("can't play any Pokémon that has an Ability") or
+            # "can't play any cards from their hand" -- evolving included.
+            if pokemon_play_blocked(board, player_id, card) \
+                    or state.play_locked(player_id, card):
+                continue
+            stage = card.get_attribute(AttrID.STAGE)
+            if stage == PokemonStage.LEGEND.value:
+                if bench_has_space and any(complementary_halves(card, other)
+                                           for other in hand_area.children):
+                    entries.append(_target_map_entry(
+                        game_id, card.entity_id,
+                        action_id_for(card.entity_id, "play"), ACTION_PLAY_POKEMON,
+                        [entity_list_target_info([bench_area.entity_id])],
+                    ))
+                continue
+            if stage == PokemonStage.BASIC.value:
+                if getattr(def_for(card.archetype_id), "unplayable_from_hand", False):
+                    continue  # Shedinja: enters play only via an effect
+                # Fossils stay Item cards in hand: Item locks gate the bench play.
+                if card.get_attribute(AttrID.TRAINER_TYPE) is not None \
+                        and (state.play_locked(player_id, card)
+                             or trainer_play_blocked(board, player_id, card)):
+                    continue
+                if bench_has_space:
+                    # The bench area is the drop target; without it the drag
+                    # dead-ends at the ActionsNode and nothing highlights.
+                    entries.append(_target_map_entry(
+                        game_id, card.entity_id,
+                        action_id_for(card.entity_id, "play"), ACTION_PLAY_POKEMON,
+                        [entity_list_target_info([bench_area.entity_id])],
+                    ))
+                continue
+
+            evolves_from = card.get_attribute(AttrID.EVOLUTION_LOGIC_FROM)
+            if not evolves_from:
+                continue
+            evolve_targets = [p.entity_id for p in evolve_targets_for(board, state, player_id, card)]
+            if evolve_targets:
+                entries.append(_target_map_entry(
+                    game_id, card.entity_id,
+                    action_id_for(card.entity_id, "evolve"), ACTION_EVOLVE,
+                    [entity_list_target_info(evolve_targets)],
+                ))
+
+        elif isinstance(card, EnergyEntity):
+            if not in_play_ids:
+                continue
+            unlimited = state.unlimited_energy_turn.get(player_id) == state.turn_number
+            if state.energy_attached and not state.bonus_energy_target_id and not unlimited:
+                continue
+            if state.play_locked(player_id, card):
+                continue
+            definition = def_for(card.archetype_id)
+            condition = getattr(definition, "attach_condition", None)
+            if condition is not None and not condition(board, player_id):
+                continue
+            attach_to = getattr(definition, "attach_to", None)
+            targets = [
+                p.entity_id for p in in_play
+                if (attach_to is None or attach_to(p))
+                and (unlimited or not state.energy_attached
+                     or (p.entity_id == state.bonus_energy_target_id
+                         and state.energy_attachments_this_turn
+                         < 1 + extra_manual_energy_attachments(board, p)))
+                and not state.attach_restricted(p.entity_id)
+                and not energy_attachment_blocked(board, player_id, card, p)
+            ]
+            if targets:
+                entries.append(_target_map_entry(
+                    game_id, card.entity_id,
+                    action_id_for(card.entity_id, "energy"), ACTION_PLAY_ENERGY,
+                    [entity_list_target_info(targets)],
+                ))
+
+        elif isinstance(card, TrainerEntity):
+            trainer_type = card.get_attribute(AttrID.TRAINER_TYPE)
+            if state.play_locked(player_id, card) \
+                    or trainer_play_blocked(board, player_id, card):
+                continue
+            definition = def_for(card.archetype_id)
+            condition = getattr(definition, "condition", None)
+            if not trainer_condition_met(condition, board, player_id, card):
+                continue
+            if trainer_type == TrainerType.ITEM.value:
+                entries.append(_target_map_entry(
+                    game_id, card.entity_id,
+                    action_id_for(card.entity_id, "item"), ACTION_USE_TRAINER,
+                ))
+            elif trainer_type == TrainerType.SUPPORTER.value:
+                # Normally Supporters are illegal on turn 1 (going first).
+                # Cards like Team Rocket's Proton set usable_first_turn.
+                first_ok = bool(getattr(definition, "usable_first_turn", False))
+                played = max(state.supporters_played,
+                             1 if state.supporter_played else 0)
+                if played < effective_supporter_limit(board, player_id) and (
+                    state.turn_number > 1 or first_ok
+                ):
+                    entries.append(_target_map_entry(
+                        game_id, card.entity_id,
+                        action_id_for(card.entity_id, "supporter"), ACTION_USE_TRAINER,
+                    ))
+            elif trainer_type == TrainerType.STADIUM.value:
+                if not state.stadium_played and not same_stadium_in_play(board, card):
+                    orientation = stadium_orientation_target_info(definition)
+                    entries.append(_target_map_entry(
+                        game_id, card.entity_id,
+                        action_id_for(card.entity_id, "stadium"), ACTION_PLAY_STADIUM,
+                        [orientation] if orientation else None,
+                    ))
+            elif trainer_type == TrainerType.POKEMON_TOOL.value:
+                tool_targets = [
+                    p.entity_id for p in tool_attachment_targets(board, player_id, card)
+                ]
+                if tool_targets:
+                    entries.append(_target_map_entry(
+                        game_id, card.entity_id,
+                        action_id_for(card.entity_id, "tool"), ACTION_ATTACH_TOOL,
+                        [entity_list_target_info(tool_targets)],
+                    ))
+
+    entries.extend(_ability_entries(board, state, player_id, game_id, in_play))
+    # Evolution cards with a hand Ability (Trumbeak) also carry an "Evolve"
+    # button in that same panel (see PokemonCardDef), because the client stops
+    # accepting the evolve drag once the card offers a hand Ability.
+    entries.extend(_out_of_zone_ability_entries(board, state, player_id, game_id))
+    entries = _one_way_to_evolve_from_hand(entries)
+    entries.extend(_stadium_ability_entries(board, state, player_id, game_id))
+    # Asleep/Paralyzed gates attacks per-attack (Attack(usable_despite_conditions)).
+    immobilized = _active_immobilized(board, player_id)
+    entries.extend(_attack_entries(board, state, player_id, game_id, immobilized))
+    if not immobilized or (
+            board.active_pokemon(player_id) is not None
+            and can_retreat_despite_conditions(board, board.active_pokemon(player_id))):
+        entries.extend(_retreat_entry(board, state, player_id, game_id))
+    # A turn kept alive past an attack (Fluffy Barrage / Festival Lead) stays
+    # in the attack phase: only attacking (or End Turn) remains legal. The
+    # session asks "perform another attack?" before re-offering.
+    if state.attacks_used:
+        entries = [
+            e for e in entries
+            if e["selectableAction"]["description"] == ACTION_USE_ATTACK
+        ]
+    return entries
+
+
+def ability_condition_met(ability, board, player_id, source) -> bool:
+    """Menu and execution share printed prerequisites, even without a callback."""
+    from spirit.game.card_effects.standard_era import (
+        ability_position_allowed, standard_ability, standard_ability_condition,
+    )
+    from spirit.game.data_utils import unimplemented
+
+    if ability.effect is None or ability.effect is unimplemented:
+        return False
+    from spirit.game.session.activation_permissions import public_activation_allowed
+    if not public_activation_allowed(ability, board, player_id, source):
+        return False
+    if not ability_position_allowed(board, player_id, source, ability.game_text):
+        return False
+    condition = ability.condition
+    # A late import/reprint must not turn a missing generated callback into
+    # unconditional permission. Bespoke effect conditions remain authoritative.
+    if condition is None and ability.effect is standard_ability:
+        condition = standard_ability_condition(ability.game_text)
+    return condition is None or bool(condition(board, player_id, source))
+
+
+def _ability_entries(
+    board: BoardState,
+    state: TurnState,
+    player_id: str,
+    game_id: str,
+    in_play: List[PokemonEntity],
+) -> List[Dict[str, Any]]:
+    """Usable activated abilities on the player's in-play Pokemon."""
+    entries = []
+    for pokemon in in_play:
+        for entry in pokemon.get_attribute(AttrID.PIE_ABILITIES) or []:
+            if not isinstance(entry, dict):
+                continue
+            ability_id = entry.get("abilityID")
+            ability = ABILITIES_BY_ID.get(ability_id) if ability_id else None
+            if ability is None or ability.activation not in (
+                    Activations.ONCE_PER_TURN, Activations.UNLIMITED):
+                continue
+            # Hand/discard-only abilities (Pyukumuku, Beedrill, Gengar) are
+            # offered from those zones, never from in-play.
+            if ability.usable_from:
+                continue
+            # Path to the Peak locks a Pokemon's own Abilities, but a Tool-
+            # granted ability (Forest Seal Stone) lives on the tool, not the
+            # Pokemon, so it stays usable.
+            if ability_locked(board, pokemon, ability) and not ability.is_granted:
+                continue
+            if ability.activation != Activations.UNLIMITED \
+                    and (pokemon.entity_id, ability_id) in state.used_abilities:
+                continue
+            if ability.vstar and player_id in state.vstar_used:
+                continue
+            if ability.effect is None:
+                continue
+            if ability.shared_once_per_turn \
+                    and ability.shared_once_per_turn in state.used_named_abilities:
+                continue
+            if not ability_condition_met(ability, board, player_id, pokemon):
+                continue
+            # The actionID must be the PIE_ABILITIES abilityID so the pulled-
+            # back panel can resolve the ability's text.
+            entries.append(_target_map_entry(
+                game_id, pokemon.entity_id, ability_id, ACTION_USE_ABILITY,
+                selection_type=SELECTION_TYPE_PANEL,
+            ))
+    return entries
+
+
+def _one_way_to_evolve_from_hand(entries):
+    """An Evolution card in hand with a hand Ability (Trumbeak's Mountain
+    Pass) must offer EITHER the click panel OR the drag-to-evolve, never both.
+
+    Oct 11 test: with both offered the client picks the card up on click
+    (no panel) and then refuses every drop, so the card can neither evolve
+    nor use its Ability.  When the real Ability is offered, the panel's
+    "Evolve" button does the evolving and the drag entry goes; when it isn't
+    (already used, empty deck), the plain drag evolve stays and the lone
+    "Evolve" button goes.
+    """
+    from spirit.game.data_utils import ABILITIES_BY_ID
+
+    def panel_title(entry):
+        action = entry.get("selectableAction") or {}
+        if action.get("description") != ACTION_USE_ABILITY \
+                or action.get("selectionType") != SELECTION_TYPE_PANEL:
+            return None
+        ability = ABILITIES_BY_ID.get(action.get("actionID"))
+        return getattr(ability, "title", None) if ability is not None else None
+
+    real_panel, evolve_button = set(), set()
+    for entry in entries:
+        title = panel_title(entry)
+        if title is None:
+            continue
+        (evolve_button if title == "Evolve" else real_panel).add(entry["entityID"])
+    mixed = evolve_button  # only Evolution cards with a hand Ability get the button
+    out = []
+    for entry in entries:
+        eid = entry.get("entityID")
+        if eid in mixed:
+            description = (entry.get("selectableAction") or {}).get("description")
+            if eid in real_panel and description == ACTION_EVOLVE:
+                continue                      # panel's Evolve button handles it
+            if eid not in real_panel and panel_title(entry) == "Evolve":
+                continue                      # no panel: plain drag evolve
+        out.append(entry)
+    return out
+
+
+def _is_evolution_card(card) -> bool:
+    stage = card.get_attribute(AttrID.STAGE)
+    return stage is not None and stage not in (
+        PokemonStage.BASIC.value, PokemonStage.RESTORED.value)
+
+
+def _out_of_zone_ability_entries(
+    board: BoardState, state: TurnState, player_id: str, game_id: str
+) -> List[Dict[str, Any]]:
+    """Abilities flagged usable_from='hand'/'discard' on the player's cards in
+    those zones, each offered with its own client selection flow.
+
+    Hand sources get AbilitySelection (click -> ability panel) plus OutOfPlay
+    (playmat drag). Discard sources get the panel alone: OutOfPlay disables
+    clicks there, which soft-locked the ability.
+
+    Ruling: the usual ability locks (Path to the Peak) read "Pokemon in play",
+    so they do NOT gate hand/discard sources. A lock that names these zones
+    (Garbotoxin) answers blocks_out_of_play_abilities instead, and that one
+    does gate them.
+    """
+    entries = []
+    for zone in ("hand", "discard"):
+        area = board.find_player_area(player_id, zone)
+        for card in (area.children if area else []):
+            for entry in card.get_attribute(AttrID.PIE_ABILITIES) or []:
+                if not isinstance(entry, dict):
+                    continue
+                ability_id = entry.get("abilityID")
+                ability = ABILITIES_BY_ID.get(ability_id) if ability_id else None
+                if ability is None or ability.usable_from != zone:
+                    continue
+                if not ability.is_rule_action and out_of_play_ability_locked(board, card):
+                    continue
+                if ability.effect is None:
+                    continue
+                if ability.activation not in (
+                        Activations.ONCE_PER_TURN, Activations.UNLIMITED):
+                    continue
+                if ability.activation != Activations.UNLIMITED \
+                        and (card.entity_id, ability_id) in state.used_abilities:
+                    continue
+                if ability.vstar and player_id in state.vstar_used:
+                    continue
+                if ability.shared_once_per_turn \
+                        and ability.shared_once_per_turn in state.used_named_abilities:
+                    continue
+                if not ability_condition_met(ability, board, player_id, card):
+                    continue
+                # Hand: AbilitySelection opens the ability panel so Pitch can
+                # coexist with a Basic's drag-to-bench play, and the second
+                # entry below keeps the playmat-drop path.
+                if zone == "hand":
+                    entries.append(_target_map_entry(
+                        game_id, card.entity_id, ability_id, ACTION_USE_ABILITY,
+                        selection_type=SELECTION_TYPE_PANEL,
+                    ))
+                # An Evolution card in hand (Trumbeak's Mountain Pass) is also
+                # dragged onto a Pokémon to evolve it.  The OutOfPlay playmat
+                # drop captured that drag as the Ability, so evolving was
+                # impossible; the click panel above still offers the Ability.
+                if zone == "hand" and _is_evolution_card(card):
+                    continue
+                entries.append(_target_map_entry(
+                    game_id, card.entity_id, ability_id, ACTION_USE_ABILITY,
+                    # OutOfPlay disables clicks; discard cards need the ability panel.
+                    selection_type=(SELECTION_TYPE_PANEL if zone == "discard"
+                                    else SelectionKind.OUT_OF_PLAY.value),
+                ))
+    return entries
+
+
+def _glc_forbids_stadium_search(board, player_id, definition) -> bool:
+    """GLC's Salvatore ruling: no typed Stadium search your deck can't contain."""
+    from spirit import config
+    if not config.GLC_ONLY:
+        return False
+    from spirit.game.glc import stadium_search_is_impossible
+    return stadium_search_is_impossible(board, player_id, definition)
+
+
+def _stadium_ability_entries(
+    board: BoardState, state: TurnState, player_id: str, game_id: str
+) -> List[Dict[str, Any]]:
+    """The in-play Stadium's activated ability (Training Court), offered once
+    during each player's turn. Only the active player is offered actions and
+    used_abilities resets each turn, so (stadium, ability) is a clean
+    once-per-player-turn key."""
+    stadium_area = board.find_global_area("activeStadium")
+    entries = []
+    for stadium in (stadium_area.children if stadium_area else []):
+        definition = def_for(stadium.archetype_id)
+        ability = getattr(definition, "ability", None)
+        if ability is None or ability.effect is None or not ability.ability_id:
+            continue
+        if (stadium.entity_id, ability.ability_id) in state.used_abilities:
+            continue
+        if not ability_condition_met(ability, board, player_id, stadium):
+            continue
+        if _glc_forbids_stadium_search(board, player_id, definition):
+            continue
+        entries.append(_target_map_entry(
+            game_id, stadium.entity_id, ability.ability_id, ACTION_USE_ABILITY,
+            selection_type=SELECTION_TYPE_PANEL,
+        ))
+    return entries
+
+
+def _retreat_entry(
+    board: BoardState, state: TurnState, player_id: str, game_id: str
+) -> List[Dict[str, Any]]:
+    """Retreat offer for the Active (once per turn, cost payable, bench occupied)."""
+    if state.retreated:
+        return []
+    active = board.active_pokemon(player_id)
+    if not active:
+        return []
+    if state.retreat_locked(active.entity_id) or retreat_blocked(board, active):
+        return []
+    bench_area = board.find_player_area(player_id, "bench")
+    bench_ids = [
+        c.entity_id for c in (bench_area.children if bench_area else [])
+        if isinstance(c, PokemonEntity)
+    ]
+    if not bench_ids:
+        return []
+    cost = effective_retreat_cost(board, active)
+    energies = board.attached_energies(active)
+    if sum(energy_provided_count(e, board) for e in energies) < cost:
+        return []
+
+    # New active FIRST, cost LAST: the Done button only renders on a node with
+    # no successor (NodeToAdvanceTo()==null), and SelectingForAnAbility()
+    # special-cases the RetreatNewActive kind as an action's first node.
+    new_active_info = entity_list_target_info(
+        bench_ids, kind=SelectionKind.RETREAT_NEW_ACTIVE.value
+    )
+    new_active_info["targetPrompt"] = {"id": PROMPT_RETREAT_NEW_ACTIVE}
+    infos = [new_active_info]
+    if cost > 0:
+        energy_values = {
+            energy.entity_id: energy_provided_count(energy, board)
+            for energy in energies
+        }
+        total_payment = sum(energy_values.values())
+        # If every attached Energy card is required, there is no meaningful
+        # payment choice.  This must use the effective value rather than an
+        # exact-total comparison: under Wild Growth two printed Grass Energy
+        # provide 4 units and are both required to pay a retreat cost of 3.
+        # The legacy client's picker only sees the printed pips, so resolve
+        # this unambiguous payment on the server.
+        every_card_required = all(
+            total_payment - energy_values[energy.entity_id] < cost
+            for energy in energies
+        )
+        # Burn Brightly & co.: when the only legal payment is fixed, pay it
+        # here instead of making the tray demand extra printed Energy.
+        forced = None if every_card_required else \
+            forced_energy_payment(energies, cost, board)
+        if every_card_required or forced:
+            entry = _target_map_entry(
+                game_id, active.entity_id,
+                action_id_for(active.entity_id, "retreat"), ACTION_RETREAT,
+                infos, selection_type=SELECTION_TYPE_PANEL,
+            )
+            entry["_autoRetreatEnergyIDs"] = [
+                e.entity_id for e in (forced or energies)]
+            return [entry]
+        # d.j's pip tray tallies each picked card's provided amount against
+        # valueToSelect (a double energy pays 2); numberToSelect only caps
+        # the card count. targetPrompt is the tray's label (it caches the
+        # last prompt shown, so leaving it unset displays stale text).
+        info = entity_list_target_info(
+            [e.entity_id for e in energies],
+            number_to_select=min(cost, len(energies)),
+            minimum_to_select=-1,
+            kind=SelectionKind.RETREAT_COST_ENTITY_LIST.value,
+        )
+        info["valueToSelect"] = cost
+        info["targetPrompt"] = {"id": PROMPT_RETREAT_COST}
+        infos.append(info)
+    return [_target_map_entry(
+        game_id, active.entity_id,
+        action_id_for(active.entity_id, "retreat"), ACTION_RETREAT,
+        infos, selection_type=SELECTION_TYPE_PANEL,
+    )]
+
+
+def trainer_condition_met(condition, board: BoardState, player_id: str, card) -> bool:
+    """condition(board, player_id[, card]) -- 3-arg variants get the specific
+    hand copy (Nugget's turn-draw provenance is per-card)."""
+    from spirit.game.session.trainer_resource_permissions import public_trainer_allowed
+    if not public_trainer_allowed(board, player_id, card):
+        return False
+    if condition is None:
+        return True
+    code = getattr(condition, "__code__", None)
+    if code is not None and code.co_argcount >= 3:
+        return bool(condition(board, player_id, card))
+    return bool(condition(board, player_id))
+
+
+def _stadium_name(card: TrainerEntity) -> str:
+    """Stable Stadium name shared by reprints with different archetype IDs."""
+    definition = def_for(getattr(card, "archetype_id", None) or "")
+    display_name = getattr(definition, "display_name", None)
+    if display_name:
+        return " ".join(str(display_name).split()).casefold()
+
+    name = card.get_attribute(AttrID.NAME)
+    if isinstance(name, dict):
+        name = name.get("id", "")
+    return " ".join(str(name or "").split()).casefold()
+
+
+def stadium_orientation_target_info(definition) -> Optional[Dict[str, Any]]:
+    """Native card-rotation node used by Parallel City-style Stadiums."""
+    choices = list(getattr(definition, "orientation_choices", None) or [])
+    if len(choices) != 2:
+        return None
+    return {
+        "name": SelectionKind.ORIENTATION_CUSTOM_CHOICE.value,
+        "selected": True,
+        "targetPrompt": {"id": "Choose which way the Stadium faces"},
+        "sortType": None,
+        "titles": [{"id": title} for title, _ in choices],
+        "choices": [{"id": description} for _, description in choices],
+    }
+
+
+def same_stadium_in_play(board: BoardState, card: TrainerEntity) -> bool:
+    """A Stadium is unplayable if one with the same name is already in play."""
+    # No exception for directional Stadiums: a second Parallel City can't
+    # be played over the first just to turn it around.
+    stadium_area = board.find_global_area("activeStadium")
+    incoming_name = _stadium_name(card)
+    return any(
+        (
+            incoming_name
+            and _stadium_name(existing) == incoming_name
+        )
+        or getattr(existing, "archetype_id", None) == card.archetype_id
+        for existing in (stadium_area.children if stadium_area else [])
+    )
+
+
+_USAGE_RESTRICTION = re.compile(
+    r"this attack only|can(?:'t|not| not) use (?:this attack|[a-z' -]+)"
+    r"|can(?:'t|not) attack|use this attack only"
+    r"|this attack can(?:'t|not| not) be used")
+
+
+def attack_has_usage_restriction(definition) -> bool:
+    """Whether the printed text limits when the attack may be USED, as opposed
+    to effects that simply do nothing on an empty board."""
+    if getattr(getattr(definition, "condition", None), "usage_restriction", False):
+        return True
+    text =(getattr(definition, "game_text", "") or "").casefold().replace("’", "'")
+    return bool(_USAGE_RESTRICTION.search(text)) or not text
+
+
+def _attack_entries(
+    board: BoardState, state: TurnState, player_id: str, game_id: str,
+    immobilized: bool = False,
+) -> List[Dict[str, Any]]:
+    """Usable attacks of the Active Pokemon (energy requirement met)."""
+    active = board.active_pokemon(player_id)
+    if not active or attacks_blocked(board, active):
+        return []
+    # A passive (Windup Arm) can exempt the whole Pokemon from the gate.
+    if immobilized and can_attack_despite_conditions(board, active):
+        immobilized = False
+    abilities = active.get_attribute(AttrID.PIE_ABILITIES) or []
+    if not isinstance(abilities, list):
+        logging.warning(
+            f"[LegalActions] Unparsed PIE_ABILITIES on {active.entity_id}: {abilities!r}"
+        )
+        return []
+
+    energies = board.attached_energies(active)
+    entries = []
+    for ability in abilities:
+        # abilityType carries the PieAbilityDescription class-name hint string.
+        if ability.get("abilityType") != "Attack":
+            continue
+        ability_id = ability.get("abilityID")
+        if not ability_id:
+            continue  # legacy scripts without ability IDs can't be offered
+        if state.attack_locked(active.entity_id, ability_id):
+            continue
+        definition = ABILITIES_BY_ID.get(ability_id)
+        # Asleep/Paralyzed suppression, per-attack exemptable (Windup Arm).
+        if immobilized and not getattr(definition, "usable_despite_conditions", False) \
+                and not _usable_while_asleep(definition, active):
+            continue
+        # The player going first cannot attack on turn 1 unless the attack
+        # explicitly allows it (Indeedee's Watch Over).
+        if state.turn_number == 1 \
+                and not getattr(definition, "usable_first_turn", False) \
+                and not can_attack_on_first_turn(board, active):
+            continue
+        if definition is not None and definition.vstar \
+                and player_id in state.vstar_used:
+            continue
+        if definition is not None and definition.gx \
+                and player_id in state.gx_used \
+                and not state.can_repeat_gx(player_id, active):
+            continue
+        if definition is not None and definition.gx \
+                and player_id in state.gx_locked_players:
+            continue
+        # Attack usage restriction ("You can use this attack only if...").
+        # An attack with no printed restriction can always be declared, even
+        # when its effect would find nothing (Slowpoke's Ideal Fishing Day
+        # with no Item in the discard pile still does its damage/ends the turn).
+        if definition is not None and definition.condition is not None \
+                and attack_has_usage_restriction(definition) \
+                and not definition.condition(board, player_id, active):
+            continue
+        # Cost-modifying passives (e.g. Excited Heart) apply here.
+        cost = effective_attack_cost(board, active, ability.get("cost") or {}, attack=definition)
+        if attack_cost_satisfied(cost, energies, board):
+            entries.append(_target_map_entry(
+                game_id, active.entity_id, ability_id, ACTION_USE_ATTACK,
+                selection_type=SELECTION_TYPE_PANEL,
+            ))
+    return entries
+
+
+# TargetInformation kind: l.m node -> command l.L renders the choices (full
+# PieAbilityDescription rows: cost pips, damage, owner type) in the panel's
+# bonus ability scroll list.
+KIND_CAKE_ATTACK_CHOICE = "CakeAttackCustomChoiceTargetInformation"
+
+
+def copy_attack_choice_node(
+    source_entity_id: str,
+    candidates: List[Tuple[Any, Any]],
+    prompt: str = "",
+) -> Dict[str, Any]:
+    """A CakeAttackCustomChoiceTargetInformation node whose `choices` are the
+    [(pokemon, attack)] candidates' PieAbilityDescription dicts; the reply
+    rides an IntTargetResponse (`amount` = candidate index). Never build one
+    from an empty list (l.L's scroll list would soft-lock)."""
+    choices: List[Dict[str, Any]] = []
+    for i, (pokemon, attack) in enumerate(candidates):
+        row = attack.to_dict()
+        # Each choice needs its own GUID: l.L matches the clicked button by ID.
+        row["abilityID"] = action_id_for(source_entity_id, f"copychoice:{i}")
+        types = pokemon.get_attribute(AttrID.POKEMON_TYPES) or []
+        row["bonusInfo"] = {
+            "originalOwnerTypes": list(types) or [PokemonTypes.COLORLESS.value]
+        }
+        choices.append(row)
+    return {
+        "name": KIND_CAKE_ATTACK_CHOICE,
+        "selected": True,
+        "targetPrompt": {"id": prompt},
+        "sortType": None,
+        "choices": choices,
+    }

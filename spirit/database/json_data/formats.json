@@ -1,0 +1,26 @@
+{
+  "formats": [
+    {
+      "key": "GymLeaderChallenge",
+      "guid": "6402e830-7fed-4cd1-b172-2a320047c2bb",
+      "formatName": "Modified",
+      "sets": [],
+      "allSets": true,
+      "bannedCards": [],
+      "extraLegalCards": [],
+      "legalFrom": {},
+      "regulationMarks": []
+    },
+    {
+      "key": "Unlimited",
+      "guid": "6a1dec5a-34db-4cee-a503-4ee759304135",
+      "formatName": "Unlimited",
+      "sets": [],
+      "allSets": true,
+      "bannedCards": [],
+      "extraLegalCards": [],
+      "legalFrom": {},
+      "regulationMarks": []
+    }
+  ]
+}
