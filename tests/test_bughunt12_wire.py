@@ -1,6 +1,6 @@
 """Bug hunt 7 (Oct 13): what the clients are SENT during bot games.
 
-tools: /home/claude/bughunt/wire/wire_check.py mirrors every packet each seat
+tools: audits/results/wire/wire_check.py mirrors every packet each seat
 receives into a client-side model and compares it with the server board at
 every main-phase offer and after forced reconnect snapshots.
 

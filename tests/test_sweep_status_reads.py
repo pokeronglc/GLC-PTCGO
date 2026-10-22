@@ -12,7 +12,7 @@
 
 Every other attack that mentions a condition without giving one is run with
 and without conditions and listed (manual) with its results.
-Report: /home/claude/bughunt/sweep/status_reads.json
+Report: audits/results/sweep/status_reads.json
 """
 import json
 import os

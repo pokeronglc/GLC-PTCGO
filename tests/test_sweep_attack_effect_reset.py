@@ -38,7 +38,7 @@ with its own script is tested separately from the shared interpreter):
 Player-wide effects ("your opponent can't play Item cards", "whenever they
 flip a coin") are not effects on a Pokémon and are counted as skipped.
 
-Report: /home/claude/bughunt/sweep/attack_effect_reset.json
+Report: audits/results/sweep/attack_effect_reset.json
 """
 import json
 import os

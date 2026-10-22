@@ -15,7 +15,7 @@ right player must draw exactly the right number; "you may" is also tested with
 the choice declined; "draw until" is tested with the hand already at/above the
 target and with a deck smaller than the draw.
 
-Reports: /home/claude/bughunt/sweep/draw_<group>.json (failures, skipped and
+Reports: audits/results/sweep/draw_<group>.json (failures, skipped and
 the texts no template understood, with counts).
 """
 import ast

@@ -16,7 +16,7 @@ compared with what the text allows (which cards, whose, how many), the
 discard prompts are checked (candidates offered, minimum, who chooses), and
 damage tied to the discard is checked.
 
-Reports: /home/claude/bughunt/sweep/attack_discard.json
+Reports: audits/results/sweep/attack_discard.json
 Real bugs: targeted @expectedFailure tests at the bottom (# BUG: ...).
 """
 import collections

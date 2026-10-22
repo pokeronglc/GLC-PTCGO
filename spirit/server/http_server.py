@@ -304,6 +304,17 @@ class MockHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         privacy_path = os.path.join(ASSET_DIR, "eula", "en_us_privacy_policy_pc.txt")
         return self.serve_static_file(privacy_path, 'text/plain; charset=utf-8')
 
+    def _scheme(self) -> str:
+        """'https' when nginx received the request over HTTPS (it sets
+        X-Forwarded-Proto on the glcptcgo.duckdns.org site), else 'http'.
+        Links handed to the client (AssetURL, the CAS login address, the
+        login redirect) must keep the scheme the client used: a plain-http
+        login address would be redirected by nginx, and a redirected POST
+        loses the password. The port-8000 site sets no header -> 'http',
+        so existing players see no change."""
+        proto = (self.headers.get('X-Forwarded-Proto') or '') if self.headers else ''
+        return 'https' if proto.strip().lower() == 'https' else 'http'
+
     def _send_bytes(self, payload: bytes, content_type: str, cache: str = 'no-store',
                     cors: bool = False):
         self.send_response(200)
@@ -417,15 +428,15 @@ class MockHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
             "LatestMacPatcherVersion": 240,
             "LatestWindowsClientVersion": 5815,
             "LatestMacClientVersion": 5815,
-            "WindowsPatcherDownloadLink": f"http://{host}/refresher.zip",
-            "MacPatcherDownloadLink": f"http://{host}/refresher.zip"
+            "WindowsPatcherDownloadLink": f"{self._scheme()}://{host}/refresher.zip",
+            "MacPatcherDownloadLink": f"{self._scheme()}://{host}/refresher.zip"
         }
         self.send_json_response(response)
 
     def handle_messaging_manifest(self):
         """Source Logic: ServerManifestDataRetriever.cs — null 'messaging' array NREs the Tournament scene."""
         host = self.headers.get("Host", state.SERVER_HOST)
-        self.send_json_response({"cdn_url": f"http://{host}/", "messaging": []})
+        self.send_json_response({"cdn_url": f"{self._scheme()}://{host}/", "messaging": []})
 
     def handle_manifest_version(self):
         """Source Logic: LoadManifestVersion.cs"""
@@ -686,14 +697,14 @@ class MockHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         state.SERVER_HOST = host
 
         # The AssetURL is the base for all .unity3d downloads.
-        cdn_base = f"http://{host}/"
+        cdn_base = f"{self._scheme()}://{host}/"
 
         self.send_json_response({
-            "hostName": f"http://{host}/cas",
+            "hostName": f"{self._scheme()}://{host}/cas",
             "AssetURL": cdn_base,
-            "collectorURL": f"http://{host}/collector/",
-            "helpButtonDestination": f"http://{host}/help/",
-            "localizedSignup": f"http://{host}/signup/",
+            "collectorURL": f"{self._scheme()}://{host}/collector/",
+            "helpButtonDestination": f"{self._scheme()}://{host}/help/",
+            "localizedSignup": f"{self._scheme()}://{host}/signup/",
             "serviceID": "pokemon_tcgo",
             # ``BackgroundImageBehaviour`` builds the asset key as
             # ``Background{resolution}/Background{release}``.  The spelling
@@ -782,7 +793,7 @@ class MockHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
                 host = self.headers.get("Host", state.SERVER_HOST)
                 body = f"ticket={ticket}\n?ticket={ticket}\n&ticket={ticket}".encode('utf-8')
                 self.send_response(302)
-                self.send_header('Location', f'http://{host}/cas/sso/login?ticket={ticket}')
+                self.send_header('Location', f'{self._scheme()}://{host}/cas/sso/login?ticket={ticket}')
                 self.send_header('Content-type', 'text/html')
                 self.send_header('Content-Length', str(len(body)))
                 self.end_headers()

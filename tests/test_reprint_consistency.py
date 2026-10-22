@@ -15,7 +15,7 @@ otherwise identical stats/costs/damage) is grouped too, and the normalized
 text is compared as behaviour because the generic text interpreters
 (standard_attack, bw_legacy_*) read it at runtime.
 
-Run: PYTHONPATH=/home/claude/stubs:. python3 -m unittest tests.test_reprint_consistency
+Run: PYTHONPATH=. python3 -m unittest tests.test_reprint_consistency
 """
 import collections
 import difflib

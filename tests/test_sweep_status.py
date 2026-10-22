@@ -18,7 +18,7 @@ Attacks with any condition sentence not understood (e.g. "if the Defending
 Pokémon is a Basic Pokémon, it is now Paralyzed") go on the manual list
 with their measured results.
 
-Report: /home/claude/bughunt/sweep/status_inflict.json
+Report: audits/results/sweep/status_inflict.json
 """
 import json
 import os

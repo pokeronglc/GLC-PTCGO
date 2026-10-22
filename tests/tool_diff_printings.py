@@ -87,7 +87,7 @@ class Diff(unittest.IsolatedAsyncioTestCase):
         idx = path_index()
         from spirit.game.data_utils import CARD_DEFS_BY_GUID
         by = {f"{d.set_code}.{d.collector_number}": d for d in CARD_DEFS_BY_GUID.values()}
-        groups = json.load(open('/home/claude/bughunt/flag_groups.json'))
+        groups = json.load(open('audits/results/flag_groups.json'))
         out = []
         for g in groups:
             if not g['head'].startswith('T'): continue
@@ -98,13 +98,13 @@ class Diff(unittest.IsolatedAsyncioTestCase):
                 out.append(f"DIFF {g['head']}\n" + "\n".join(f"     {p}: {r}" for p, r in zip(paths, res)))
             else:
                 out.append(f"same {g['head']}")
-        open('/home/claude/bughunt/diff_trainers.txt','w').write("\n".join(out))
+        open('audits/results/diff_trainers.txt','w').write("\n".join(out))
 
     async def test_diff(self):
         idx = path_index()
         from spirit.game.data_utils import CARD_DEFS_BY_GUID
         by = {f"{d.set_code}.{d.collector_number}": d for d in CARD_DEFS_BY_GUID.values()}
-        groups = json.load(open('/home/claude/bughunt/flag_groups_all.json'))
+        groups = json.load(open('audits/results/flag_groups_all.json'))
         out = []
         for g in groups:
             if not g['head'].startswith(('A','B','X')): continue
@@ -117,5 +117,5 @@ class Diff(unittest.IsolatedAsyncioTestCase):
                 title = fixtures.definition(paths[0]).abilities[i].title
                 if not same:
                     out.append(f"DIFF {g['head']} :: {title}\n" + "\n".join(f"     {p}: {r}" for p, r in zip(paths, res)))
-        open('/home/claude/bughunt/diff_report.txt','w').write("\n".join(out))
+        open('audits/results/diff_report.txt','w').write("\n".join(out))
         print(len(out), 'differences')

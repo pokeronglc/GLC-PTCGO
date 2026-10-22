@@ -32,8 +32,8 @@ picked from that list by hand and checked in SecondCoat.
 Known bugs (expected failures): Buggy Turbo ignores its coin (tails never
 discards), Second Coat offers un-swappable Energy as the first pick.
 
-Run:    cd /home/claude/work && PYTHONPATH=/home/claude/stubs:. python3 -m unittest tests.test_sweep_ability_energy_discard
-Report: /home/claude/bughunt/sweep/ability_energy_discard.json
+Run:    PYTHONPATH=. python3 -m unittest tests.test_sweep_ability_energy_discard
+Report: audits/results/sweep/ability_energy_discard.json
 """
 import collections
 import json

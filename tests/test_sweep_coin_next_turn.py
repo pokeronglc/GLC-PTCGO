@@ -12,7 +12,7 @@
   * Allergy Storm (heads: no Supporters; tails: no Items).
 
 The opponent's attacker is Dialga (Heavy Impact, 210, no text) on P2.
-Report: /home/claude/bughunt/sweep/coin_next_turn.json
+Report: audits/results/sweep/coin_next_turn.json
 """
 import json
 import os

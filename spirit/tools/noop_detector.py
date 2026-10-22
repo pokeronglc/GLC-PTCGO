@@ -23,9 +23,9 @@ Each flag carries "excuses" (tails, chose fewer than allowed, empty search,
 game over ...) so legit no-ops can be told apart from the suspicious ones.
 
 Usage (from the repo root):
-  PYTHONPATH=/home/claude/stubs:. python3 -m spirit.tools.noop_detector run \
-      --decks /home/claude/bughunt/limitless_decks.txt \
-      --out /home/claude/bughunt/noop/results.jsonl --boards 40 --jobs 2
+  PYTHONPATH=. python3 -m spirit.tools.noop_detector run \
+      --decks audits/results/decks.txt \
+      --out audits/results/noop/results.jsonl --boards 40 --jobs 2
   ... noop_detector run --card SL.DamageMover_58 --boards 20 --out /tmp/x.jsonl
   ... noop_detector summarize --results .../results.jsonl
   ... noop_detector replay --card SL.DamageMover_58 --kind trainer --seed 1234
@@ -229,7 +229,7 @@ def _loc():
     return _LOC
 
 
-TCGDATA_DIRS = [os.environ.get('NOOP_TCGDATA', '/tmp/claude-0/tcgdata/repo/cards/en')]
+TCGDATA_DIRS = [os.environ.get('NOOP_TCGDATA', 'audits/results/tcgdata/cards/en')]
 _PRINTED = None
 REMINDER_RX = re.compile(r'^(You may play (only 1|any number|as many)|This card stays in play|'
                          r'You may play only 1 Stadium|Attach a Pok.mon Tool|If this card is attached to 1 of your Pok.mon, discard it at the end)', re.I)
@@ -1749,7 +1749,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest='cmd', required=True)
     r = sub.add_parser('run')
-    r.add_argument('--decks', default='/home/claude/bughunt/limitless_decks.txt')
+    r.add_argument('--decks', default='audits/results/decks.txt')
     r.add_argument('--out', required=True)
     r.add_argument('--boards', type=int, default=40)
     r.add_argument('--jobs', type=int, default=1)
@@ -1765,7 +1765,7 @@ def main():
     s.add_argument('--json')
     s.add_argument('--no-recheck', action='store_true', help='trust stored flags instead of re-deriving them')
     p = sub.add_parser('replay')
-    p.add_argument('--decks', default='/home/claude/bughunt/limitless_decks.txt')
+    p.add_argument('--decks', default='audits/results/decks.txt')
     p.add_argument('--card', required=True)
     p.add_argument('--kind', required=True)
     p.add_argument('--title')

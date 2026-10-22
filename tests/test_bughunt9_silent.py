@@ -1,6 +1,6 @@
 """Bug hunt 9: card text the engine silently ignores.
 
-Found by differential audits (/home/claude/bughunt/silent_*.py): each clause was
+Found by differential audits (audits/results/silent_*.py): each clause was
 run on a board where it is TRUE and one where it is FALSE (or a qualifying vs a
 non-qualifying Pokémon) and the outcomes compared.  Every test below asserts the
 PRINTED behaviour; the ones the engine gets wrong are expectedFailure + # BUG.

@@ -2,7 +2,7 @@
 
 Every distinct Pokémon attack / activated Ability, Trainer, Special Energy and
 play-from-hand trigger was run once on a rich board by
-/home/claude/bughunt/prompt_audit.py; every prompt was logged and checked
+audits/results/prompt_audit.py; every prompt was logged and checked
 against the printed text (prompt_classify.py).  The tests below pin the real
 bugs found, grouped by root cause.  Each asserts the CORRECT behaviour.
 """

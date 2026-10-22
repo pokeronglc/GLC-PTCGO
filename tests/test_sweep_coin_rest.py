@@ -10,7 +10,7 @@ Out).  Any measured change no rule explains is also a failure.  Sentences no
 rule recognises put the attack on the "manual" list with its measured results
 so a person can read them.
 
-Report: /home/claude/bughunt/sweep/coin_rest.json
+Report: audits/results/sweep/coin_rest.json
 """
 import json
 import os

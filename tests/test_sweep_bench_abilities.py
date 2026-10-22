@@ -50,8 +50,8 @@ bug | untested (could not set up / no observable effect) | self_only (only
 affects the card's own attacks/retreat) | out_of_scope.
 Known bugs are pinned by BenchVsActiveScenarios (expected failures).
 
-Run:  cd /home/claude/work && PYTHONPATH=/home/claude/stubs:. python3 -m unittest tests.test_sweep_bench_abilities
-Report: /home/claude/bughunt/sweep/bench_abilities.json
+Run:  PYTHONPATH=. python3 -m unittest tests.test_sweep_bench_abilities
+Report: audits/results/sweep/bench_abilities.json
 """
 import asyncio
 import collections

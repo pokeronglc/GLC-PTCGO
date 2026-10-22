@@ -1,7 +1,7 @@
 """Bug hunt 10: "next turn" / "this turn" effects (timing, scope, expiry).
 
 Regression tests for real bugs found by the next-turn sweep
-(/home/claude/bughunt/hunt4/). Each asserts the CORRECT behaviour; the ones
+(audits/results/hunt4/). Each asserts the CORRECT behaviour; the ones
 still broken are marked @unittest.expectedFailure with a `# BUG:` line.
 """
 import unittest

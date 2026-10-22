@@ -17,7 +17,7 @@ Modes (--mode):
          seeded random legal action otherwise.
   mixed  one seat of each (what a real "bot match" looks like).
 
-Usage (from the repo root, PYTHONPATH=/home/claude/stubs:.):
+Usage (from the repo root, PYTHONPATH=.):
   python3 -m spirit.tools.stress_bots --games 200 --workers 2 --seed 1
   python3 -m spirit.tools.stress_bots --replay 1000017 [--mode net]
   python3 -m spirit.tools.stress_bots --minutes 45 --workers 2
@@ -53,8 +53,8 @@ import types
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-DEFAULT_DECKS = "/home/claude/bughunt/limitless_decks.txt"
-DEFAULT_OUT = "/home/claude/bughunt/stress"
+DEFAULT_DECKS = "audits/results/decks.txt"
+DEFAULT_OUT = "audits/results/stress"
 TURN_CAP = 200
 STALL_SECONDS = 20.0          # no wire traffic for this long = soft lock
 HARD_TIMEOUT_SECONDS = 240.0  # wall-clock ceiling per game (CPU-bound loops)

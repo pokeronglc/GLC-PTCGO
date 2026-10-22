@@ -1,6 +1,6 @@
 """Bug hunt 11: always-on effects (passive Abilities, Tools, Stadiums, Special Energy).
 
-Found by an on/off differential probe (/home/claude/bughunt/hunt5/h5_probe.py): every
+Found by an on/off differential probe (audits/results/hunt5/h5_probe.py): every
 continuous text in the GLC pool was put on a board in several placements and the
 observable numbers (damage, HP, retreat cost, types, locks, conditions, costs ...)
 compared with the same board where the passive is switched off.  Each test below

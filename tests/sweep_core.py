@@ -25,7 +25,7 @@ from spirit.game.attributes import AttrID, PokemonTypes
 from spirit.game.data_utils import CARD_DEFS_BY_GUID, PokemonCardDef, Attack
 from spirit.tools.effect_smoke import P1, P2
 
-REPORT_DIR = '/home/claude/bughunt/sweep'
+REPORT_DIR = 'audits/results/sweep'
 BIG = 999
 
 

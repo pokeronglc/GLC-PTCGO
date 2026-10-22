@@ -4,7 +4,7 @@ Regression tests for real game bugs found by re-running the whole-database
 sweep checkers (and cross-cutting Trainer / Ability sweeps) on odd boards:
 Rare Candy stacks, Poké Dolls / Robo Substitute / fossils in play, Tools,
 Electrode attached as Energy, Ability locks, full Benches and empty decks,
-damaged / conditioned / W-R defenders.  Tooling: /home/claude/bughunt/hunt3.
+damaged / conditioned / W-R defenders.  Tooling: audits/results/hunt3.
 """
 import unittest
 

@@ -28,7 +28,7 @@ checks, stall detection, seeded replay) with:
 Findings of the first run (2026-10-12) are pinned in
 tests/test_doll_stress_findings.py.
 
-Usage (repo root, PYTHONPATH=/home/claude/stubs:.):
+Usage (repo root, PYTHONPATH=.):
   python3 -m spirit.tools.stress_dolls --build-pool
   python3 -m spirit.tools.stress_dolls --games 1000 --workers 4 --seed 31
   python3 -m spirit.tools.stress_dolls --replay 3100017 [--mode net]
@@ -55,7 +55,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from spirit.tools import stress_bots as sb
 
-OUT_DIR = "/home/claude/bughunt/stress_doll"
+OUT_DIR = "audits/results/stress_doll"
 POOL_PATH = os.path.join(OUT_DIR, "doll_pool.txt")
 
 # Limitless "Robo Substitute PHF 102" -> engine display name.

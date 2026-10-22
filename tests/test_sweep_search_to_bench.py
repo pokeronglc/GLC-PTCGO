@@ -9,7 +9,7 @@ filler Items.  The chooser always takes the maximum it is offered, coins are
 heads; the number benched must equal the printed number (capped by the 5
 free Bench spaces).
 
-Report: /home/claude/bughunt/sweep/search_to_bench.json
+Report: audits/results/sweep/search_to_bench.json
 """
 import json
 import os

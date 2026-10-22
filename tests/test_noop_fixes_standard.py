@@ -3,7 +3,7 @@
 their printed effect could happen, or stayed dark although an independent
 part of the effect could.
 
-Boards follow /home/claude/bughunt/noop/repro_confirmed.py and
+Boards follow audits/results/noop/repro_confirmed.py and
 repro_top_findings.py.  House rules: a card is playable when any part of its
 effect can be done (unless the printed text forbids it); a pick from a public
 zone must take at least one card.
