@@ -93,9 +93,13 @@ class GenericAttackClauses(unittest.IsolatedAsyncioTestCase):
             rig, e, ctx = self.ctx(path, title)
             state = rig.session.turn_state
             self.assertTrue(ctx.ability.condition(rig.board, P1, ctx.source))
-            state.attack_titles_prev_turn_by_player[P2] = [title]
+            # The lock is on the player (John's ruling): the opponent's lock
+            # doesn't affect us; ours does, on our next turn.
+            state.lock_attack_name(P2, title)
+            state.turn_number += 2
             self.assertTrue(ctx.ability.condition(rig.board, P1, ctx.source))
-            state.attack_titles_prev_turn_by_player[P1] = [title]
+            state.lock_attack_name(P1, title)
+            state.turn_number += 2
             self.assertFalse(ctx.ability.condition(rig.board, P1, ctx.source))
             ctx.deal_damage = AsyncMock()
             ctx.shuffle_into_deck = AsyncMock()

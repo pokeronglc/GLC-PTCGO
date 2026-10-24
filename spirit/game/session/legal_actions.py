@@ -165,6 +165,10 @@ class TurnState:
     # (entity_id, ability_id) -> last turn number the attack stays locked
     # ("during your next turn, this Pokemon can't use ...").
     attack_locks: Dict[Tuple[str, str], int] = field(default_factory=dict)
+    # (player_id, attack title) -> last locked turn. Player-level lock keyed
+    # by attack NAME (Giratina DLR 045 Chaos Crawler): switching Pokemon
+    # doesn't clear it; only Pokemon Ranger-style removal does.
+    attack_name_locks: Dict[Tuple[str, str], int] = field(default_factory=dict)
     # entity_id -> last turn number retreat stays locked ("the Defending
     # Pokemon can't retreat"); LOCK_UNTIL_LEAVES_ACTIVE = until it leaves.
     retreat_locks: Dict[str, int] = field(default_factory=dict)
@@ -379,6 +383,20 @@ class TurnState:
     def require_attach_ends_turn(self, entity_id: str, title: str = "", *, from_attack=True):
         self.attach_ends_turn_checks[entity_id] = (EffectExpiry(self.turn_number + 1, from_attack), title)
 
+    def lock_attack_name(self, player_id: str, title: str, *, from_attack=False):
+        """`player_id` can't use any attack named `title` during their next
+        turn (from any Pokemon -- the lock is on the player).  It is a
+        condition of the attack's own text, not an effect of an attack on a
+        Pokemon, so Pokemon Ranger leaves it alone (owner ruling Oct 24;
+        Ranger still removes Chaos Crawler's / Cavern Tackle's shield)."""
+        expiry = EffectExpiry(self.turn_number + 2, from_attack)
+        expiry.locked_from = self.turn_number + 1
+        self.attack_name_locks[(player_id, title.casefold())] = expiry
+
+    def attack_name_locked(self, player_id: str, title: str) -> bool:
+        expiry = self.attack_name_locks.get((player_id, (title or '').casefold()), 0)
+        return getattr(expiry, "locked_from", 0) <= self.turn_number <= expiry
+
     def attack_locked(self, entity_id: str, ability_id: str) -> bool:
         expiry = self.attack_locks.get((entity_id, ability_id), 0)
         return getattr(expiry, "locked_from", 0) <= self.turn_number <= expiry
@@ -448,6 +466,8 @@ class TurnState:
                 return True
         if any(key[0] in pokemon_ids and live(exp) for key, exp in self.attack_locks.items()):
             return True
+        if any(key[0] in players and live(exp) for key, exp in self.attack_name_locks.items()):
+            return True
         for name, targets, index in (
             ('attack_flip_checks', pokemon_ids, 0),
             ('attach_ends_turn_checks', pokemon_ids, 0),
@@ -480,6 +500,8 @@ class TurnState:
                                 if key not in pokemon_ids or not attack(value)})
         self.attack_locks = {key: exp for key, exp in self.attack_locks.items()
                              if key[0] not in pokemon_ids or not attack(exp)}
+        self.attack_name_locks = {key: exp for key, exp in self.attack_name_locks.items()
+                                  if key[0] not in players or not attack(exp)}
         for name, targets, index in (
             ('attack_flip_checks', pokemon_ids, 0),
             ('attach_ends_turn_checks', pokemon_ids, 0),
@@ -1328,6 +1350,9 @@ def _attack_entries(
         if state.attack_locked(active.entity_id, ability_id):
             continue
         definition = ABILITIES_BY_ID.get(ability_id)
+        if state.attack_name_locks and state.attack_name_locked(
+                player_id, getattr(definition, "title", None) or ability.get("title", "")):
+            continue
         # Asleep/Paralyzed suppression, per-attack exemptable (Windup Arm).
         if immobilized and not getattr(definition, "usable_despite_conditions", False) \
                 and not _usable_while_asleep(definition, active):

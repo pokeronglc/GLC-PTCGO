@@ -792,3 +792,62 @@ def more_prizes_remaining_than_opponent(board, player_id, pokemon=None):
     mine = board.find_player_area(player_id, "prizePile")
     theirs = board.find_player_area(opponent, "prizePile") if opponent else None
     return len(mine.children if mine else []) > len(theirs.children if theirs else [])
+
+
+# --- "As often as you like" Abilities, resolved in one activation ----------
+# Player report (Oct 23): Slowbro's Strange Behavior and Quagsire's Wash Out
+# are used 8-12 times a turn; one activation per use took minutes per game.
+
+async def move_counters_to_self_freely(ctx):
+    """Slowbro SV1 43 Strange Behavior: "As often as you like during your
+    turn, you may move 1 damage counter from 1 of your other Pokémon to this
+    Pokémon."  Pick a damaged Pokémon, 1 counter moves, pick again -- until
+    Done or none of your other Pokémon has damage left."""
+    def damaged_others():
+        out = []
+        for pokemon in ctx.my_pokemon_in_play():
+            if pokemon is ctx.source:
+                continue
+            if effective_max_hp(ctx.board, pokemon) > pokemon.get_attribute(AttrID.HP, 0):
+                out.append(pokemon)
+        return out
+
+    async def step():
+        sources = damaged_others()
+        if not sources:
+            return False
+        source = await ctx.choose_pokemon(
+            sources, "Choose a Pokémon to move 1 damage counter from (Done to stop)",
+            optional=True)
+        if source is None:
+            return False
+        return bool(await ctx.move_damage_counters(source, ctx.source, 1))
+
+    await ctx.repeat_ability_freely(step)
+
+
+def move_energy_bench_to_active_freely(energy_type, label: str):
+    """Quagsire DRM 26 / Dewgong ME3 19 Wash Out: "As often as you like ...
+    move a Water Energy from 1 of your Benched Pokémon to your Active
+    Pokémon."  The Active is the only destination, so it is never asked
+    for; pick any number of the Benched Pokémon's Water Energy at once
+    (each one is a separate use of the Ability)."""
+    from spirit.game.card_effects.pokemon import energy_provides_type
+
+    async def effect(ctx):
+        active = ctx.my_active()
+        if active is None:
+            return
+        pool = [energy for pokemon in ctx.my_bench()
+                for energy in ctx.attached_energies(pokemon)
+                if energy_provides_type(energy, energy_type.value)]
+        if not pool:
+            return
+        picks = await ctx.choose_cards(
+            pool, len(pool), minimum=0,
+            prompt=f"Choose any number of {label} Energy to move to your Active Pokémon")
+        for energy in picks:
+            if ctx.my_active() is not active or not ctx.pokemon_is_in_play(active):
+                break
+            await ctx.move_energy(energy, active)
+    return effect

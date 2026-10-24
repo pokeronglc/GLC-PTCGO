@@ -80,7 +80,10 @@ def printed_attack_allowed(raw, board, player_id, source):
             present = {t for p in cards(player_id, 'bench') for t in effective_pokemon_types(board, p)}
             if not all(getattr(PokemonTypes, word.upper()).value in present for word in value):
                 return False
-        if kind == 'not_previous_attack' and value in {t.casefold() for t in titles}:
+        # Player-level lock set when the attack is used (lock_repeat_titles),
+        # so Pokémon Ranger can remove it -- John's ruling, Oct 2026.
+        if kind == 'not_previous_attack' and state is not None \
+                and state.attack_name_locked(player_id, value):
             return False
         if kind == 'previous_attack':
             subject, title = value
@@ -106,3 +109,16 @@ def install_attack_requirement(attack):
             original is None or bool(original(board, player_id, source)))
     condition._printed_requirement = True
     attack.condition = condition
+
+
+def lock_repeat_titles(state, player_id, raw):
+    """'If 1 of your Pokémon used <X> during your last turn, this attack can't
+    be used' (Mewtwo XY12 Barrier, Walrein Cold Snap, Terrakion Cavern Tackle,
+    Giratina Chaos Crawler): record a player-level lock for <X> through the
+    player's next turn. Switching or the user leaving play doesn't clear it;
+    Pokémon Ranger does (TurnState.remove_attack_effects)."""
+    if state is None:
+        return
+    for kind, value in requirements(raw)[0]:
+        if kind == 'not_previous_attack':
+            state.lock_attack_name(player_id, value)

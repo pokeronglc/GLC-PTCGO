@@ -6194,6 +6194,11 @@ async def _evolve_each_from_deck(ctx, text, heads):
     # onto freshly benched Pokémon is legal and standard play.
     candidates = [p for p in candidates
                   if not evolution_blocked(ctx.board, ctx.player_id, p, from_hand=False)]
+    # Player report (Oct 23): only offer Pokémon that something in the card
+    # pool evolves from (Entei has no evolution in GLC).
+    from spirit.game.data_utils import has_evolution_in_pool
+    candidates = [p for p in candidates
+                  if has_evolution_in_pool(p.get_attribute(AttrID.EVOLUTION_LOGIC_NAME))]
     def evolutions_for(pokemon):
         logic = pokemon.get_attribute(AttrID.EVOLUTION_LOGIC_NAME)
         return lambda c: (is_pokemon_card(c) and c.get_attribute(AttrID.STAGE)

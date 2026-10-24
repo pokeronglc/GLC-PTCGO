@@ -1234,6 +1234,9 @@ class EffectContext:
                 and not ability.condition(self.board, self.player_id, self.attacker):
             return False
         self._copy_chain.append(ability.title)
+        # A copied Barrier/Chaos Crawler still counts as "1 of your Pokémon used" it.
+        from spirit.game.card_effects.attack_requirements import lock_repeat_titles
+        lock_repeat_titles(self.session.turn_state, self.player_id, ability.game_text)
         # The attack actually declared and paid for (Foul Play): owner ruling
         # Oct 21 -- a copied attack's "extra Energy in addition to this
         # attack's cost" counts against the COPYING attack's cost.
@@ -2939,6 +2942,35 @@ class EffectContext:
         self.suppress_announce = not self.completed_attachment_loop
         return attached
 
+    async def repeat_ability_freely(self, step) -> int:
+        """Run an "as often as you like" Ability's one-use `step` again and
+        again inside ONE activation, until `step` returns False (the player
+        pressed Done, or nothing is left to do).  Each use is shown on both
+        clients before the next choice, and the Ability is announced once at
+        the end -- the same flow as attach_from_hand_freely (Frosmoth).
+        Player report (Oct 23): Slowbro's Strange Behavior used 12 times a
+        turn needed 12 separate activations."""
+        from .legal_actions import ability_condition_met
+
+        done = 0
+        self.suppress_announce = True
+        while self.pokemon_is_in_play(self.source) \
+                and not ability_locked(self.board, self.source, self.ability) \
+                and ability_condition_met(self.ability, self.board, self.player_id, self.source):
+            if not await step():
+                break
+            done += 1
+            await self.flush_choreography()
+            pending, self.deferred_actions = self.deferred_actions, []
+            for action in pending:
+                await action()
+            await self.session.resolve_knockouts(self)
+            self.knockouts.clear()
+            await self.session.enforce_bench_capacity()
+        self.completed_attachment_loop = bool(done) and self.pokemon_is_in_play(self.source)
+        self.suppress_announce = not self.completed_attachment_loop
+        return done
+
     async def attach_card(self, card: CardEntity, pokemon: PokemonEntity) -> bool:
         """Attach a non-Energy card moved by an effect.
 
@@ -3543,6 +3575,9 @@ async def resolve_attack(session, player_id: str, attacker: PokemonEntity,
     session.turn_state.attacks_used.append(
         (attacker.entity_id, attacker.archetype_id, title)
     )
+    if ability is not None:
+        from spirit.game.card_effects.attack_requirements import lock_repeat_titles
+        lock_repeat_titles(session.turn_state, player_id, ability.game_text)
 
     if effect is None or effect is unimplemented:
         if effect is unimplemented:

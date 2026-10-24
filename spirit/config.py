@@ -63,3 +63,14 @@ BLANK_AVATARS = os.environ.get(
 GLC_ONLY = os.environ.get(
     "SPIRIT_GLC_ONLY", "1"
 ).strip().lower() not in ("0", "false", "no", "off")
+
+# How long the server waits for players' clients to finish their animations
+# before offering the next action, as a fraction of the estimated animation
+# time (constants.SEQUENCE_DURATION_SECONDS). 1.0 = the full estimate (the
+# original pacing); lower is snappier, 0 = never wait. Owner request Oct 23:
+# measured waits averaged ~3 s per action. Change it on the server with
+# SPIRIT_ANIM_PACING (e.g. 0.6) in the service's environment -- no code change.
+try:
+    ANIM_PACING = max(0.0, min(2.0, float(os.environ.get("SPIRIT_ANIM_PACING", "1.0"))))
+except ValueError:
+    ANIM_PACING = 1.0

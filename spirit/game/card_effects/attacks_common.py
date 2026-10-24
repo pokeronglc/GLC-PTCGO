@@ -787,3 +787,18 @@ async def discard_random_from_hand(ctx, player_id: Optional[str] = None,
     picks = random.sample(hand, min(count, len(hand)))
     await ctx.discard_cards(picks)
     return picks
+
+
+# "If 1 of your Pokémon used <X> during your last turn, this attack can't be
+# used." (Terrakion SIT 97 Cavern Tackle, Giratina DLR 045 Chaos Crawler).
+# John's ruling (Oct 2026): the restriction is on the player, survives
+# switching or the user leaving play, and Pokémon Ranger removes it.
+# The lock itself is recorded generically when the attack is used
+# (attack_requirements.lock_repeat_titles).
+def attack_name_unlocked(title):
+    """Attack condition: false while the player's `title` lock is live."""
+    def condition(board, player_id, pokemon):
+        state = getattr(board, "turn_state", None)
+        return state is None or not state.attack_name_locked(player_id, title)
+    return condition
+

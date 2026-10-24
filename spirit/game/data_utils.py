@@ -377,6 +377,25 @@ def evolves_from_chain(archetype_id: Optional[str]) -> List[str]:
     return chain
 
 
+_EVOLVES_FROM_NAMES: set = set()
+_EVOLVES_FROM_SIZE = -1
+
+
+def has_evolution_in_pool(logic_name: Optional[str]) -> bool:
+    """Whether any loaded card (the GLC card pool) evolves from a Pokémon
+    with this EVOLUTION_LOGIC_NAME.  Entei has none, so effects that evolve
+    from the deck (TM: Evolution) don't offer it."""
+    global _EVOLVES_FROM_SIZE
+    if _EVOLVES_FROM_SIZE != len(CARD_DEFS_BY_GUID):
+        _EVOLVES_FROM_NAMES.clear()
+        for d in CARD_DEFS_BY_GUID.values():
+            from_name = _string_attr(d, AttrID.EVOLUTION_LOGIC_FROM)
+            if from_name:
+                _EVOLVES_FROM_NAMES.add(from_name)
+        _EVOLVES_FROM_SIZE = len(CARD_DEFS_BY_GUID)
+    return bool(logic_name) and logic_name in _EVOLVES_FROM_NAMES
+
+
 def evolves_from(archetype_id: Optional[str], base_logic_name: str) -> bool:
     """Whether a card's evolution line includes `base_logic_name` anywhere
     below it (Rare Candy: Stage2 over a Basic two steps down)."""

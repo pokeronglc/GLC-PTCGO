@@ -1,3 +1,4 @@
+from spirit.game.card_effects.support_common import move_counters_to_self_freely
 from spirit.game.data_utils import Attack, Ability, PokemonCardDef, Activations, Triggers
 from spirit.game.attributes import PokemonTypes, PokemonStage, Rarities
 from spirit.game.card_effects.standard_era import (
@@ -28,7 +29,7 @@ card = PokemonCardDef(
         Ability(
             title='Strange Behavior',
             game_text='As often as you like during your turn, you may move 1 damage counter from 1 of your other Pokémon to this Pokémon.',
-            effect=standard_ability,
+            effect=move_counters_to_self_freely,
             activation=Activations.UNLIMITED,
         ),
         Attack(

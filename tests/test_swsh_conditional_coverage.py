@@ -174,8 +174,11 @@ class SwshConditionalCoverageTests(unittest.IsolatedAsyncioTestCase):
         rig,e=self.rig('SWSH12.Terrakion_97')
         attack=fixtures.definition('SWSH12.Terrakion_97').abilities[0]
         self.assertTrue(attack.condition(rig.board,P1,e['target']))
+        # The lock is on the player, so it holds even once the user has left play.
         old=self.add(rig,fixtures.definition('SWSH12.Terrakion_97'),P1,'discard')
-        self.previous_turn(rig,[(old.entity_id,old.archetype_id,'Cavern Tackle')])
+        state=rig.session.turn_state
+        state.lock_attack_name(P1,'Cavern Tackle')
+        state.turn_number+=2
         self.assertFalse(attack.condition(rig.board,P1,e['target']))
 
     async def test_self_attack_history_and_immediate_retaliation_history_are_separate(self):

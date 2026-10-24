@@ -1,3 +1,6 @@
+from spirit.game.card_effects.support_common import move_energy_bench_to_active_freely
+from spirit.game.attributes import PokemonTypes as _PT
+_WASH_OUT = move_energy_bench_to_active_freely(_PT.WATER, "Water")
 from spirit.game.data_utils import Attack, Ability, PokemonCardDef, Activations, Triggers
 from spirit.game.attributes import PokemonTypes, PokemonStage, Rarities
 from spirit.game.card_effects.standard_era import (
@@ -28,7 +31,7 @@ card = PokemonCardDef(
         Ability(
             title='Wash Out',
             game_text='As often as you like during your turn (before your attack), you may move a Water Energy from 1 of your Benched Pokémon to your Active Pokémon.',
-            effect=standard_ability,
+            effect=_WASH_OUT,
             activation=Activations.UNLIMITED,
         ),
         Attack(

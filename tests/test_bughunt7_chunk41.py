@@ -358,14 +358,14 @@ class Chunk41(unittest.IsolatedAsyncioTestCase):
 
     # --- Dewgong POR 19: Wash Out ------------------------------------------------------
     # BUG: "As often as you like" is read as "move any number of Energy": one use moves every Water Energy.
-    async def test_dewgong_wash_out_moves_one_energy_per_use(self):
+    async def test_dewgong_wash_out_moves_any_number_in_one_use(self):
+        # Player report Oct 23: pick any number of Water Energy in one
+        # activation (each counts as a use of "as often as you like").
         t = self.table()
         active = self.mine(t, self.filler)
         dew = self.mine(t, DEWGONG, 'bench')
         waters = t.energy(dew, WATER, 2)
         await t.use(dew, 'Wash Out')
-        self.assertEqual(sum(w in active.children for w in waters), 1)
-        await t.use(dew, 'Wash Out')                 # usable again: as often as you like
         self.assertEqual(sum(w in active.children for w in waters), 2)
 
     async def test_dewgong_wash_out_water_only(self):

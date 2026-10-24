@@ -3,11 +3,12 @@ from spirit.game.attributes import PokemonTypes, PokemonStage, Rarities
 from spirit.game.card_effects.passives_common import protect_next_turn
 
 
-from spirit.game.card_effects.attacks_common import previous_attack_matches
+from spirit.game.card_effects.attacks_common import (
+    attack_name_unlocked,
+)
 
-
-def _cavern_tackle_condition(board, player_id, pokemon):
-    return not previous_attack_matches(board, player_id, title="Cavern Tackle")
+# Player-level lock (same ruling as Giratina DLR 045): switching doesn't
+# clear it, Pokémon Ranger does.
 
 
 card = PokemonCardDef(
@@ -32,7 +33,7 @@ card = PokemonCardDef(
             game_text="During your opponent's next turn, prevent all damage from attacks done to this Pok\u00e9mon. If 1 of your Pok\u00e9mon used Cavern Tackle during your last turn, this attack can't be used.",
             cost={PokemonTypes.FIGHTING: 2, PokemonTypes.COLORLESS: 1},
             damage=120,
-            condition=_cavern_tackle_condition,
+            condition=attack_name_unlocked("Cavern Tackle"),
             effect=protect_next_turn(prevent=True),
         ),
     ],

@@ -38,6 +38,20 @@
   td.hi { color: var(--accent); font-weight: 700; }
   .empty { color: var(--muted); padding: 10px 0; }
   footer { max-width: 1100px; margin: 0 auto; padding: 0 16px 30px; color: var(--muted); font-size: 12px; }
+  .badges-wrap { max-width: 1100px; margin: 0 auto; padding: 12px 16px 0; }
+  .badge-row { display: flex; align-items: center; gap: 10px; padding: 8px 0;
+               border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  .badge-row:last-child { border-bottom: 0; }
+  .badge-name { font-weight: 600; min-width: 120px; max-width: 220px;
+                overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .badge-count { color: var(--muted); font-size: 12px; min-width: 64px; }
+  .badge-list { display: flex; flex-wrap: wrap; gap: 6px; }
+  .badge { display: inline-flex; align-items: center; justify-content: center;
+           width: 26px; height: 26px; border-radius: 50%; color: #fff;
+           font: 700 12px/1 system-ui, sans-serif; box-shadow: inset 0 0 0 2px rgba(255,255,255,.35); }
+  .legend { display: flex; flex-wrap: wrap; gap: 10px; margin: 2px 0 10px; color: var(--muted); font-size: 12px; }
+  .legend span { display: inline-flex; align-items: center; gap: 4px; }
+  .legend .badge { width: 18px; height: 18px; font-size: 10px; }
 </style>
 </head>
 <body>
@@ -45,6 +59,14 @@
   <h1>GLC Leaderboard</h1>
   <div class="sub" id="status">Loading…</div>
 </header>
+<div class="badges-wrap">
+  <section>
+    <h2>Badge board</h2>
+    <div class="note">Win 4 Versus games in a row with the same deck type to earn that type's badge</div>
+    <div class="legend" id="badge_legend"></div>
+    <div id="badge_board"></div>
+  </section>
+</div>
 <main>
   <section>
     <h2>Most wins</h2>
@@ -93,7 +115,7 @@
       <tbody id="top_special_energy"></tbody></table>
   </section>
 </main>
-<footer>Updates automatically every minute. Only games between players count; bot games and guest accounts don't. Deck statistics use each deck's games since its last edit, so they match the cards it holds now.</footer>
+<footer>Updates automatically every minute. Only games between players count; bot games and guest accounts don't. Deck statistics use each deck's games since its last edit, so they match the cards it holds now. Badges count Versus games only (not friend challenges, tournaments or bot games); a loss or a game with another type starts the count again.</footer>
 <script>
   var COLUMNS = {
     top_wins: [["wins", true], ["played"], ["win_rate", false, "%"]],
@@ -135,10 +157,62 @@
       body.appendChild(tr);
     });
   }
+  var TYPES = {
+    Grass: ["#3f9b3f", "G"], Fire: ["#d9472b", "R"], Water: ["#2f7fd1", "W"],
+    Lightning: ["#d6a800", "L"], Psychic: ["#8b4fc4", "P"], Fighting: ["#b5652a", "F"],
+    Darkness: ["#35383f", "D"], Metal: ["#7d8794", "M"], Fairy: ["#d65aa6", "Y"],
+    Dragon: ["#a07d1c", "N"], Colorless: ["#9aa1ab", "C"]
+  };
+  function badge(type) {
+    var b = document.createElement("span");
+    var t = TYPES[type] || ["#777", "?"];
+    b.className = "badge";
+    b.style.background = t[0];
+    b.textContent = t[1];
+    b.title = type + " badge";
+    return b;
+  }
+  (function legend() {
+    var box = document.getElementById("badge_legend");
+    Object.keys(TYPES).forEach(function (type) {
+      var item = document.createElement("span");
+      item.appendChild(badge(type));
+      item.appendChild(document.createTextNode(type));
+      box.appendChild(item);
+    });
+  })();
+  function fillBadges(rows, streak) {
+    var box = document.getElementById("badge_board");
+    box.textContent = "";
+    if (!rows || !rows.length) {
+      var empty = document.createElement("div");
+      empty.className = "empty";
+      empty.textContent = "No badges earned yet. Be the first: win " + (streak || 4) +
+        " Versus games in a row with one type!";
+      box.appendChild(empty);
+      return;
+    }
+    rows.forEach(function (p) {
+      var row = document.createElement("div");
+      row.className = "badge-row";
+      var name = document.createElement("span");
+      name.className = "badge-name";
+      name.textContent = p.player;
+      var count = document.createElement("span");
+      count.className = "badge-count";
+      count.textContent = p.badges.length + (p.badges.length === 1 ? " badge" : " badges");
+      var list = document.createElement("span");
+      list.className = "badge-list";
+      p.badges.forEach(function (type) { list.appendChild(badge(type)); });
+      row.appendChild(name); row.appendChild(count); row.appendChild(list);
+      box.appendChild(row);
+    });
+  }
   function load() {
     fetch("/leaderboard.json", { cache: "no-store" })
       .then(function (r) { return r.json(); })
       .then(function (d) {
+        fillBadges(d.badge_board, d.badge_streak);
         fill("top_wins", d.top_wins);
         fill("best_win_rate", d.best_win_rate);
         fill("most_active", d.most_active);

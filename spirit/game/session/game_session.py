@@ -6,6 +6,7 @@ import random
 import re
 import time
 import uuid
+from spirit import config
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 from .player_abstract import GamePlayer
 from .network_player import NetworkPlayer
@@ -228,6 +229,30 @@ def match_is_untimed(pairing: Dict[str, Any]) -> bool:
     return False
 
 
+def deck_type_of(deck) -> str:
+    """A deck's Pokémon type ("Water", ...): GLC decks are single-type, so
+    it is the type most of its Pokémon cards have. "Unknown" without any."""
+    piles = (deck or {}).get("piles") or {}
+    guids = piles.get("deck") or piles.get("CakePile") or []
+    counts = collections.Counter(str(g).lower() for g in guids)
+    types = collections.Counter()
+    from spirit.game.data_utils import PokemonCardDef, _attr_value
+    from spirit.game.attributes import PokemonTypes as _PT
+    import json as _json
+    for guid, n in counts.items():
+        d = def_for(guid)
+        if not isinstance(d, PokemonCardDef):
+            continue
+        raw = _attr_value(d, AttrID.POKEMON_TYPES, "[]") or "[]"
+        for value in (_json.loads(raw) if isinstance(raw, str) else raw):
+            try:
+                label = _PT(value).name
+            except Exception:
+                label = str(value)
+            types[label.title()] += n
+    return types.most_common(1)[0][0] if types else "Unknown"
+
+
 class GameOptions:
     """
     Represents the gameplay options and match metadata sent to the client
@@ -426,7 +451,7 @@ class GameSession:
         name = getattr(sequence_name, "value", sequence_name) or ""
         duration = SEQUENCE_DURATION_SECONDS.get(
             name, DEFAULT_SEQUENCE_DURATION_SECONDS
-        )
+        ) * config.ANIM_PACING
         now = time.monotonic()
         for player_id in set(player_ids):
             if not player_id:
@@ -531,23 +556,7 @@ class GameSession:
             piles = (deck or {}).get("piles") or {}
             guids = piles.get("deck") or piles.get("CakePile") or []
             counts = collections.Counter(str(g).lower() for g in guids)
-            # GLC decks are single-type: the deck's type is its Pokemon's type.
-            types = collections.Counter()
-            from spirit.game.data_utils import PokemonCardDef, _attr_value
-            from spirit.game.attributes import PokemonTypes as _PT
-            import json as _json
-            for guid, n in counts.items():
-                d = def_for(guid)
-                if not isinstance(d, PokemonCardDef):
-                    continue
-                raw = _attr_value(d, AttrID.POKEMON_TYPES, "[]") or "[]"
-                for value in (_json.loads(raw) if isinstance(raw, str) else raw):
-                    try:
-                        label = _PT(value).name
-                    except Exception:
-                        label = str(value)
-                    types[label.title()] += n
-            deck_type = types.most_common(1)[0][0] if types else "Unknown"
+            deck_type = deck_type_of(deck)
             deck_name = str((deck or {}).get("deckName") or "").replace("|", "/")[:40]
             parts = []
             for guid, n in sorted(counts.items(), key=lambda kv: -kv[1]):
@@ -2981,6 +2990,7 @@ class GameSession:
                     continue
                 picked = picked[:count]
                 if len(picked) >= min_effective:
+                    self._log_picked(player, prompt_text, picked)
                     return picked
                 logging.warning(
                     f"[Session {self.game_id}] Card pick under-picked "
@@ -2989,6 +2999,27 @@ class GameSession:
             return valid[:min_effective]
         finally:
             await self._set_opponents_waiting(player_id, False)
+
+    def _log_picked(self, player, prompt_text, picked):
+        """'[Session g] NAME picked: Luxurious Cape (on Pikachu), Tropical
+        Beach' -- so a report like "I picked two cards and only one went"
+        can be checked from the game log."""
+        try:
+            from spirit.game.data_utils import def_for
+            labels = []
+            for entity_id in picked:
+                entity = self.board_state.get_entity(entity_id)
+                name = getattr(def_for(getattr(entity, "archetype_id", None)),
+                               "display_name", None) or entity_id
+                holder = getattr(entity, "parent", None)
+                holder_name = getattr(def_for(getattr(holder, "archetype_id", None)),
+                                      "display_name", None) if holder is not None else None
+                labels.append(f"{name} (on {holder_name})" if holder_name else name)
+            logging.info(
+                f"[Session {self.game_id}] {getattr(player, 'screen_name', '?')} picked "
+                f"{len(picked)} ({prompt_text!r}): {', '.join(labels) or 'nothing'}.")
+        except Exception:
+            logging.info(f"[Session {self.game_id}] Picked: {picked}.")
 
     async def _set_opponents_waiting(self, player_id: str, waiting: bool):
         """Shows/clears the "opponent is deciding" banner on the other clients."""
@@ -4338,6 +4369,7 @@ class GameSession:
                     games_played=1, seconds_played=seconds,
                     upset_wins=1 if upset else 0,
                 )
+                await self._record_badge_streak(pid, player, won)
                 deck_id = self._deck_id_of(pid)
                 deck_stats = await run_db(stats_data.record_deck_result,
                                           player.account_id, deck_id, won)
@@ -4355,6 +4387,23 @@ class GameSession:
             except Exception as e:
                 logging.error(f"[Session {self.game_id}] Stats recording failed "
                               f"for {pid}: {e}", exc_info=True)
+
+    async def _record_badge_streak(self, pid, player, won):
+        """Badge board (owner request Oct 23): 4 Versus wins in a row with
+        one deck type earns that type's badge. Never breaks a game end."""
+        try:
+            from spirit.database import badge_data
+            if not badge_data.is_badge_game(self.pairing):
+                return
+            info = (self.pairing.get("players") or {}).get(pid) or {}
+            deck_type = deck_type_of(info.get("deck"))
+            earned = await run_db(badge_data.record_versus_result,
+                                  player.account_id, deck_type, won)
+            if earned:
+                logging.info(f"[Badges] {player.screen_name} earned the {earned} badge "
+                             f"({badge_data.STREAK_FOR_BADGE} Versus wins in a row).")
+        except Exception as e:
+            logging.error(f"[Session {self.game_id}] Badge streak failed for {pid}: {e}")
 
     async def _record_legacy_tournament_result(self, winner_id: str):
         """Advances the live Events-scene bracket this game belonged to."""
@@ -5857,8 +5906,9 @@ class GameSession:
                 self._sequence_envelope(EMPTY_SEQUENCE_ID, msg))
 
     async def _sync_energy_display(self):
-        """Show what attached basic Energy really provides (Burn Brightly,
-        Wild Growth, Jungle Totem, Psychic Mirage: one Fire provides FireFire).
+        """Show what attached Energy really provides (Burn Brightly, Wild
+        Growth, Jungle Totem, Psychic Mirage: one Fire provides FireFire;
+        Counter Energy while behind on Prizes provides 2).
 
         The client's Energy pip tray and card info read the entity's
         ENERGY_INFO attribute (S.y.EnergyProvidedCount), which otherwise stays
@@ -5875,8 +5925,10 @@ class GameSession:
         for pid in list(self.players):
             for pokemon in self.board_state.pokemon_in_play(pid):
                 for energy in self.board_state.attached_energies(pokemon):
-                    if not isinstance(energy, EnergyEntity) \
-                            or energy.get_attribute(AttrID.IS_SPECIAL_ENERGY):
+                    # Special Energy too: Counter Energy provides 2 while
+                    # its owner is behind on Prizes, and the client's retreat
+                    # tray otherwise counts its printed single Colorless.
+                    if not isinstance(energy, EnergyEntity):
                         continue
                     printed = energy.get_attribute(AttrID.ENERGY_INFO)
                     printed_options = printed.get("options") if isinstance(printed, dict) else None
@@ -5885,7 +5937,8 @@ class GameSession:
                     in_play.add(energy.entity_id)
                     live = [list(option) for option in
                             energy_provided_options(self.board_state, energy)]
-                    differs = bool(live) and max(len(o) for o in live) != \
+                    live_count = max((len(o) for o in live), default=0)
+                    differs = live_count > 0 and live_count != \
                         max(len(o) for o in printed_options)
                     want = live if differs else None
                     if want == sent.get(energy.entity_id):

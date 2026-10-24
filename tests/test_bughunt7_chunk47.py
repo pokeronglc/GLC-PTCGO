@@ -292,9 +292,7 @@ class Chunk47(unittest.IsolatedAsyncioTestCase):
         e1, e2 = t.energy(quag, WATER, 2)
         t.picks = lambda cards, count, prompt, display: list(cards)[:count]
         t.pokemon = lambda c, p: quag if quag in c else c[0]
-        await t.use(quag, 'Wash Out')
-        self.assertEqual(len(t.attached(active)), 1, 'one Energy per use')
-        await t.use(quag, 'Wash Out')
+        await t.use(quag, 'Wash Out')          # Oct 23: any number in one activation
         self.assertEqual({id(c) for c in t.attached(active)}, {id(e1), id(e2)})
         self.assertEqual(t.attached(quag), [])
 

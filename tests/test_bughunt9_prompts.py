@@ -153,11 +153,14 @@ class BugHunt9Prompts(unittest.IsolatedAsyncioTestCase):
 
     async def test_slowbro_strange_behavior_from_other_own_pokemon_to_itself(self):
         # FIXED Oct 13: Slowbro SV1 43 Strange Behavior: source list includes itself and the opponent's Pokémon; target is chosen.
+        # Oct 23: repeats in one activation until Done / nothing left to move.
         t, me, bench, opp, opp_bench = self.board('SV1.Slowbro_43')
+        before_me, before_bench = t.damage(me), t.damage(bench)
         await t.use(me, 'Strange Behavior')
         first = next(e for e in t.log if e[0] == 'pokemon')
         self.assertEqual(set(first[3]), {bench})        # "1 of your other Pokémon"
-        self.assertEqual(t.damage(me), 40)              # counter landed on Slowbro (30 + 10)
+        self.assertEqual(t.damage(bench), 0)
+        self.assertEqual(t.damage(me), before_me + before_bench)
 
     async def test_team_rockets_orbeetle_rocket_brain_only_own_pokemon(self):
         # FIXED Oct 13: Team Rocket's Orbeetle SV10 89 Rocket Brain offers opponent's (and non-Team Rocket) Pokémon.

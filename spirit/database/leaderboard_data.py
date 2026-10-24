@@ -179,7 +179,18 @@ def build_leaderboard():
         "best_win_rate": best_rate[:TOP_N],
         "most_active": active[:TOP_N],
         **_safe_deck_stats(),
+        "badge_board": _safe_badge_board(),
+        "badge_streak": 4,
     }
+
+
+def _safe_badge_board():
+    try:
+        from spirit.database.badge_data import get_badge_board
+        return get_badge_board()
+    except Exception as e:
+        logging.error(f"[Leaderboard] Badge board failed: {e}")
+        return []
 
 
 def _safe_deck_stats():
